@@ -1,0 +1,49 @@
+# --- local working notes (not shared; see README) -------------------------
+MEMORY.md
+
+# --- python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- environments ---------------------------------------------------------
+.venv/
+venv/
+env/
+.python-version
+
+# --- FEFF8L working directories -------------------------------------------
+# feff8l_tables.py runs FEFF in a scratch tree and copies only the
+# feffNNNN.dat it needs into data/. The run directories hold ~30 MB of
+# intermediate .pad/.json/.dat per absorber and are not worth keeping.
+results/feff8l_runs/
+results/feff8l_ms/
+**/feff.pad
+**/phase.pad
+**/pot.pad
+**/log[0-9].dat
+**/xsect.json
+**/libpotph.json
+
+# --- caches and scratch ---------------------------------------------------
+_cal*.json
+_kwscan.json
+_wcb*.json
+_band*.log
+*.npy
+scratch/
+tmp/
+data/
+
+# --- editors / OS ---------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
