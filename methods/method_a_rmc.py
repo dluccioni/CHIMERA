@@ -12,15 +12,20 @@ The classical (EvAX / RMCProfile-lineage) approach, done properly on GPU:
     which was 58% of the step time in the first cut
 
 Every replica proposes one move per step. Acceptance uses the R-space chi^2
-against |chi(R)| over the fit window, exactly the observable the experiment gives.
+over the fit window against whatever the experiment gives: |chi(R)| for
+magnitude-only files, or the COMPLEX chi(R) when chi(k) was measured (a
+complex target is detected from its dtype; Re and Im then count as separate
+residuals and `nfit` is doubled). The target may carry several channels per
+edge - one per k weight - and `ft.chan_edge` says which edge each belongs to.
 
 Two statistical details that matter for what comes out:
 
   * The per-edge amplitude is a nuisance parameter with a closed-form
     least-squares value, so by default it is profiled out inside chi^2
-    (`profile_scale=True`). The sampler then optimises exactly the quantity
-    the R-factor reports; with a frozen scale the two disagree and the "best"
-    configuration under one is not the best under the other.
+    (`profile_scale=True`), jointly over all channels of an edge. The sampler
+    then optimises exactly the quantity the R-factor reports; with a frozen
+    scale the two disagree and the "best" configuration under one is not the
+    best under the other.
   * Posterior samples are drawn from the rung whose temperature matches the
     likelihood. chi^2 here is sum(r^2)/nfit and acceptance is
     exp(-beta * dchi2 * nfit) = exp(-beta * dsum(r^2)); a Gaussian likelihood
@@ -57,7 +62,7 @@ def build_reverse_index(i_idx, j_idx, natoms):
 
 
 class RMCSampler:
-    def __init__(self, fm, ft, target_absR, mask, sigma_R,
+    def __init__(self, fm, ft, target, mask, sigma_R,
                  nrep=48, tmin=0.02, tmax=5.0, seed=0,
                  swap_frac=0.75, disp_sigma=0.015, max_disp=0.30,
                  nsp=None, collect_after=None, collect_every=25,
@@ -105,11 +110,24 @@ class RMCSampler:
         self.beta = cp.asarray(1.0 / np.geomspace(tmin, tmax, nrep))
         self._ar = cp.asarray(np.arange(nrep))
 
-        self.target = cp.asarray(target_absR)
+        self.complex = bool(np.iscomplexobj(target))
+        self.target = cp.asarray(target)
         self.mask = cp.asarray(mask)
         self.sigR = cp.asarray(sigma_R)
-        self.nfit = int(mask.sum()) * self.nsp
-        # the fit window only, gathered once: (nsp, nfit/nsp)
+        # channels: (edge, k weight) pairs, edge-major; one per edge when a
+        # single k weight is fitted (then chan_edge is just arange)
+        self.nchan = int(self.target.shape[0])
+        self.nkw = self.nchan // self.nsp
+        assert self.nkw * self.nsp == self.nchan, \
+            f"{self.nchan} channels do not divide into {self.nsp} edges"
+        chan_edge = getattr(ft, "chan_edge", None)
+        if chan_edge is not None:
+            assert np.array_equal(np.asarray(chan_edge),
+                                  np.repeat(np.arange(self.nsp), self.nkw)), \
+                "channels must be ordered edge-major"
+        # Re and Im are separate residuals for a complex target
+        self.nfit = int(mask.sum()) * self.nchan * (2 if self.complex else 1)
+        # the fit window only, gathered once: (nchan, nwin)
         self._tm = cp.ascontiguousarray(self.target[:, self.mask])
         self._sm = cp.ascontiguousarray(self.sigR[:, self.mask])
         # exchange bookkeeping (per adjacent pair), reported by run()
@@ -143,32 +161,55 @@ class RMCSampler:
         self.best_pos = self.pos.copy()
         self._alloc()
 
+    def _observe(self, chi):
+        """The model on the target's footing: complex chi(R) or |chi(R)|."""
+        return self.ft.to_R(chi) if self.complex else self.ft.magnitude(chi)
+
+    def _profiled_scale(self, m):
+        """Least-squares amplitude per EDGE, broadcast to (nrep, nchan).
+
+        s_e = Re<m.t> / <m.m> summed over the fit window and over every
+        channel of the edge - the same closed form `model.fit_scales` uses
+        for the reported R-factor with `edge` given.
+        """
+        if self.complex:
+            num = (m.real * self._tm.real[None] + m.imag * self._tm.imag[None]).sum(-1)
+            den = (m.real ** 2 + m.imag ** 2).sum(-1)
+        else:
+            num = (m * self._tm[None]).sum(-1)
+            den = (m * m).sum(-1)
+        if self.nkw > 1:
+            n = m.shape[0]
+            num = num.reshape(n, self.nsp, self.nkw).sum(-1, keepdims=True)
+            den = den.reshape(n, self.nsp, self.nkw).sum(-1, keepdims=True)
+            num = cp.broadcast_to(num, (n, self.nsp, self.nkw)).reshape(n, self.nchan)
+            den = cp.broadcast_to(den, (n, self.nsp, self.nkw)).reshape(n, self.nchan)
+        return num / cp.maximum(den, 1e-30)
+
     def _chi2(self, chi_un, count=None):
         """Reduced chi^2 per replica from the UNNORMALISED pair sum.
 
         With `profile_scale` the per-edge amplitude takes its least-squares
-        value for every replica at every step: s_e = <m.t>/<m.m> over the fit
-        window. That is the same closed form `model.fit_scales` uses for the
-        reported R-factor, so the chain and the report score the same thing.
+        value for every replica at every step (`_profiled_scale`), so the
+        chain and the report score the same thing. A complex target counts
+        Re and Im separately, matching `nfit`.
         """
         cnt = self.count if count is None else count
         chi = chi_un / cp.maximum(cnt, 1.0)[:, :, None]
-        aR = self.ft.magnitude(chi)
-        m = aR[:, :, self.mask]                     # (nrep, nsp, nwin)
+        aR = self._observe(chi)
+        m = aR[:, :, self.mask]                     # (nrep, nchan, nwin)
         if self.profile_scale:
-            s = ((m * self._tm[None]).sum(-1)
-                 / cp.maximum((m * m).sum(-1), 1e-30))
-            m = m * s[:, :, None]
+            m = m * self._profiled_scale(m)[:, :, None]
         d = (m - self._tm[None]) / self._sm[None]
-        return (d ** 2).sum(axis=(1, 2)) / self.nfit
+        sq = (d.real ** 2 + d.imag ** 2) if self.complex else d * d
+        return sq.sum(axis=(1, 2)) / self.nfit
 
     def scales(self, chi_un=None):
-        """The profiled per-edge amplitudes for the current (or given) chi."""
+        """The profiled amplitudes, (nrep, nchan), for the current (or given) chi."""
         chi_un = self.chi if chi_un is None else chi_un
         chi = chi_un / cp.maximum(self.count, 1.0)[:, :, None]
-        m = self.ft.magnitude(chi)[:, :, self.mask]
-        return cp.asnumpy((m * self._tm[None]).sum(-1)
-                          / cp.maximum((m * m).sum(-1), 1e-30))
+        m = self._observe(chi)[:, :, self.mask]
+        return cp.asnumpy(self._profiled_scale(m))
 
     # ------------------------------------------------------------------ moves
     def _alloc(self):
