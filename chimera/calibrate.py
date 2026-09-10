@@ -62,6 +62,15 @@ made and did not record; if the Athena project files turn up, the values in
 them replace stage 1 outright. The earlier manual scan that fixed k^3 and
 3-13 A^-1 is what `calibrate_legacy` still does.
 
+With chi(k) data (`chik.ChiK` inputs) two of those choices become ours:
+the window is applied identically to data and model, so it is held at the
+values given (`free_window` is switched off - searching it would only tune
+a weighting to the model), and the k weight defaults to fitting k^1, k^2 and
+k^3 at once (`KWEIGHTS_CHIK`) instead of scanning. E0 per edge stays a
+fitted parameter - now determined by the phase rather than traded against
+a0 - and `anchor_a0=False` lets the ambient lattice constant float with it,
+which is only sensible once the phase is there to separate the two.
+
 The a0 / E0 degeneracy
 ----------------------
 The first-shell peak position depends on the lattice constant and on the
@@ -83,11 +92,14 @@ from exafs_gpu.scattering import ELEMENTS, NSP
 from . import dataio as io
 from . import model as M
 from . import shellmodel as SM
+from .chik import ChiK, as_kweights, kweight_label, kweight_value
 
 A0_AMBIENT = 3.566        # equiatomic CrCoNi, literature
 FIT_RMIN, FIT_RMAX = 1.4, 5.0
 FIT_RMAX_NOMS = 4.2       # where a single-scattering model has to stop
 KMIN, KMAX, KWEIGHT = 3.0, 13.0, 3
+KWEIGHTS_MAG = (2, 3, 4)          # scanned, for |chi(R)| files
+KWEIGHTS_CHIK = ((1, 2, 3),)      # fitted together, for chi(k) files
 DR_LABELS = [f"{ELEMENTS[a]}{ELEMENTS[b]}" for a, b in zip(*np.triu_indices(NSP))]
 
 
@@ -96,12 +108,15 @@ def fit_mask(R, rmin=FIT_RMIN, rmax=FIT_RMAX):
 
 
 def _averages(spectra, pressures=None):
-    """{P: (nsp, nR)} from the dataio structure, or from a dict of arrays."""
+    """{P: data} from the dataio structure, or from a dict keyed by pressure.
+
+    `data` is a (nsp, nR) |chi(R)| array or a ChiK, whichever the files hold
+    (`dataio.fit_input`)."""
     if all(isinstance(k, (int, np.integer)) for k in spectra):
-        return {int(P): np.asarray(v, float) for P, v in spectra.items()
-                if pressures is None or P in pressures}
+        return {int(P): (v if isinstance(v, ChiK) else np.asarray(v, float))
+                for P, v in spectra.items() if pressures is None or P in pressures}
     P_all = sorted({P for (P, _el) in spectra})
-    return {P: io.average(spectra, P) for P in P_all
+    return {P: io.fit_input(spectra, P) for P in P_all
             if pressures is None or P in pressures}
 
 
@@ -201,18 +216,39 @@ def _record(sm, N0, data, mask, idx, extra=None):
 
 def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
               rmin=FIT_RMIN, rmax=FIT_RMAX, a0_ambient=A0_AMBIENT, ms=True,
-              verbose=True, kweights=(2, 3, 4), free_window=True, free_dr=True,
+              verbose=True, kweights=None, free_window=True, free_dr=True,
               free_c3=True, free_shell_sigma=True, free_dE0_per_pressure=False,
-              joint=True, de_maxiter=120, de_popsize=12, seed=0, pressures=None):
+              joint=True, de_maxiter=120, de_popsize=12, seed=0, pressures=None,
+              anchor_a0=True):
     """Global calibration in pair-count space. Returns ({P: dict}, S).
 
     See the module docstring for what is fitted where. `S` is returned set to
     the anchor-pressure calibration so it can be used for the band report.
+
+    `kweights` lists the candidates the scan chooses between; an entry may be
+    one integer or several fitted together, e.g. `(2, 3, (1, 2, 3))`. The
+    default is KWEIGHTS_MAG for |chi(R)| inputs and KWEIGHTS_CHIK for chi(k).
+    `anchor_a0=False` frees the ambient lattice constant in stage 2 (chi(k)
+    data only; see the module docstring).
     """
+    AV = _averages(spectra, pressures)
+    chik = any(isinstance(v, ChiK) for v in AV.values())
+    if chik:
+        assert all(isinstance(v, ChiK) for v in AV.values()), \
+            "cannot mix chi(k) and |chi(R)| inputs across pressures"
+        if free_window and verbose:
+            print("  chi(k) input: the k window is a choice, not a parameter - "
+                  f"holding it at {kmin}-{kmax} A^-1", flush=True)
+        free_window = False
+    elif not anchor_a0:
+        raise ValueError("anchor_a0=False needs chi(k) data: from |chi(R)| alone "
+                         "a0 and dE0 are degenerate")
+    if kweights is None:
+        kweights = KWEIGHTS_CHIK if chik else KWEIGHTS_MAG
+    kweights = [as_kweights(k) for k in kweights]
     S = S or M.Spectrum(kmin=kmin, kmax=kmax, kweight=kweight, ms=ms)
     idx = M.match_grid(S.R, R_data)
     mask = fit_mask(R_data, rmin, rmax)
-    AV = _averages(spectra, pressures)
     P0 = 0 if 0 in AV else min(AV)
     P_all = sorted(AV)
     sm = SM.ShellModel.from_spectrum(S)
@@ -230,7 +266,7 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
 
     # ---- stage 1: everything but a0, at the anchored ambient lattice constant
     def score1(x, kw, st):
-        sm.set_params(a0=a0_ambient, kweight=int(kw), **st.unpack(x))
+        sm.set_params(a0=a0_ambient, kweight=kw, **st.unpack(x))
         return sm.r_factor(N0, data0, mask, idx)
 
     # ---- stage 2: a0 (and the sigma^2 scale) per pressure, everything else
@@ -248,7 +284,7 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
         fixed = {k: v for k, v in p_shared.items() if k not in ("a0", "sigma_scale")}
         out = {}
         for P in P_all:
-            data, anchored = AV[P], (P == P0)
+            data, anchored = AV[P], (P == P0 and anchor_a0)
             bounds2 = [(np.log(0.5), np.log(6.0))] + ([] if anchored else [(3.40, 3.65)])
             y0 = [np.log(p_shared["sigma_scale"])] + ([] if anchored else [p_shared["a0"]])
             if free_dE0_per_pressure:
@@ -269,13 +305,13 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
         p = shared.unpack(x)
         tot = 0.0
         for P in P_all:
-            sm.set_params(a0=a0_P[P], sigma_scale=sig_P[P], kweight=int(kw), **p)
+            sm.set_params(a0=a0_P[P], sigma_scale=sig_P[P], kweight=kw, **p)
             tot += sm.r_factor(N0, AV[P], mask, idx)
         return tot / len(P_all)
 
     scan, best = [], None
     for kw in kweights:
-        kw = int(kw)
+        kw = as_kweights(kw)
         t0 = time.time()
         rc = differential_evolution(score1, core.bounds, args=(kw, core),
                                     maxiter=de_maxiter, popsize=de_popsize,
@@ -289,10 +325,10 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
             r, nfev = rc, int(rc.nfev)
         p1 = stage.unpack(r.x)
         p1.update(a0=a0_ambient, kweight=kw)
-        row = dict(kweight=kw, r_factor_anchor=float(r.fun), r_factor_core=float(rc.fun),
-                   n_eval=nfev)
+        row = dict(kweight=kweight_value(kw), r_factor_anchor=float(r.fun),
+                   r_factor_core=float(rc.fun), n_eval=nfev)
         if verbose:
-            print(f"  stage 1 k^{kw}: R={r.fun:.5f} (core {rc.fun:.5f})  "
+            print(f"  stage 1 {kweight_label(kw)}: R={r.fun:.5f} (core {rc.fun:.5f})  "
                   f"dE0={np.round(p1['dE0'], 2)} eV  sigma_scale={p1['sigma_scale']:.2f}"
                   + (f"  window {p1['kmin']:.2f}-{p1['kmax']:.2f}" if free_window else "")
                   + f"  [{nfev} evals, {time.time() - t0:.0f}s]", flush=True)
@@ -310,7 +346,7 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
         row["r_factor_joint"] = float(np.mean([out[P]["r_factor_ideal"] for P in P_all]))
         scan.append(row)
         if verbose:
-            print(f"  k^{kw}: mean R over {len(P_all)} pressure(s) = {row['r_factor_joint']:.5f}  "
+            print(f"  {kweight_label(kw)}: mean R over {len(P_all)} pressure(s) = {row['r_factor_joint']:.5f}  "
                   f"dr={dict(zip(DR_LABELS, np.round(np.array(p1.get('dr', np.zeros((NSP, NSP))))[np.triu_indices(NSP)], 4)))}"
                   f"  C3={p1.get('c3', [0.0])[0]:.2e}  ms_amp={p1.get('ms_amp', 0):.3f} "
                   f"ms_c={p1.get('ms_c', 0):.2f}  sigma_shell={np.round(p1.get('sigma_shell_scale', np.ones(sm.nshell)), 2)}"
@@ -320,7 +356,9 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
     _, kw_best, p_best, out = best
     shared_rec = dict(p_best, kweight_scan=scan, joint=bool(joint and len(P_all) > 1),
                       free=dict(window=free_window, dr=free_dr, c3=free_c3,
-                                shell_sigma=free_shell_sigma))
+                                shell_sigma=free_shell_sigma),
+                      target_complex=bool(chik), a0_anchored=bool(anchor_a0))
+    shared_rec["kweight"] = kweight_value(shared_rec["kweight"])
     shared_rec["dE0"] = np.asarray(shared_rec["dE0"]).tolist()
     for k in ("sigma_shell_scale", "dr", "c3"):
         if k in shared_rec:
@@ -333,7 +371,7 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
                   f"sigma2_NN={out[P]['sigma2_nn']:.5f} A^2  R_ideal={out[P]['r_factor_ideal']:.5f}",
                   flush=True)
     if verbose:
-        print(f"  chosen k^{kw_best}", flush=True)
+        print(f"  chosen {kweight_label(kw_best)}", flush=True)
     # hand the anchor-pressure calibration back through S
     sm.set_params(**{k: v for k, v in out[P0].items() if k in SM.PARAM_NAMES})
     sm.apply_to(S)
@@ -342,12 +380,14 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
 
 # ----------------------------------------------------------------- legacy
 def _objective(S, cfg, idx, data, mask):
+    tgt = M.target(data, S)
+
     def f(a0, dE0, log_sig):
         S.set_a0(a0)
         S.set_sigma_scale(np.exp(log_sig))
         S.set_window(dE0=dE0)
-        m = S.chi_R(cfg)[:, idx]
-        return M.r_factor(m, data, mask, M.fit_scales(m, data, mask)), m
+        m = M.observe(S, cfg, tgt)[:, idx]
+        return M.r_factor(m, tgt, mask, M.fit_scales(m, tgt, mask, S.chan_edge)), m
     return f
 
 
@@ -371,7 +411,8 @@ def calibrate_legacy(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEI
     idx = M.match_grid(S.R, R_data)
     mask = fit_mask(R_data, rmin, rmax)
     cfgs = [S.random_config(s) for s in seeds]
-    AV = _averages(spectra)
+    # the window is fixed here, so each pressure's target is fixed too
+    AV = {P: M.target(v, S) for P, v in _averages(spectra).items()}
 
     def score(a0, dE0, log_sig, data, log_ms_amp=None, log_ms_c=None):
         S.set_a0(a0); S.set_sigma_scale(np.exp(log_sig))
@@ -380,8 +421,8 @@ def calibrate_legacy(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEI
         S.set_window(dE0=dE0)
         tot = 0.0
         for c in cfgs:
-            m = S.chi_R(c)[:, idx]
-            tot += M.r_factor(m, data, mask, M.fit_scales(m, data, mask))
+            m = M.observe(S, c, data)[:, idx]
+            tot += M.r_factor(m, data, mask, M.fit_scales(m, data, mask, S.chan_edge))
         return tot / len(cfgs)
 
     # ---- stage 1: dE0 at the anchored ambient lattice constant
@@ -420,8 +461,8 @@ def calibrate_legacy(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEI
         if ms:
             S.set_ms(ms_amp, ms_c)
         S.set_window(dE0=dE0)
-        m = S.chi_R(cfgs[0])[:, idx]
-        scales = M.fit_scales(m, data, mask)
+        m = M.observe(S, cfgs[0], data)[:, idx]
+        scales = M.edge_scales(M.fit_scales(m, data, mask, S.chan_edge), S.chan_edge)
         nn = np.abs(np.linalg.norm((S.cell.ideal[S.j] + S.shift) - S.cell.ideal[S.i],
                                    axis=1) - S.shells[0]) < 0.05
         out[P] = dict(a0=a0, nn_distance=float(S.shells[0]), sigma_scale=sig,
@@ -460,21 +501,31 @@ def equation_of_state(cal):
 
 
 def band_report(S, cfg, idx, data, R_data, scales=None):
-    """R-factor and data/noise band by band - the evidence for the fit range."""
-    m = S.chi_R(cfg)[:, idx]
+    """R-factor and data/noise band by band - the evidence for the fit range.
+
+    One entry per channel in each list; `data` may be a |chi(R)| array or a
+    ChiK (then the bands are scored on the complex transform)."""
+    tgt = M.target(data, S)
+    m = M.observe(S, cfg, tgt)[:, idx]
     if scales is None:
-        scales = M.fit_scales(m, data, fit_mask(R_data))
+        scales = M.fit_scales(m, tgt, fit_mask(R_data), S.chan_edge)
+    elif np.size(scales) == NSP and S.nchan != NSP:
+        scales = np.asarray(scales)[S.chan_edge]
     m = m * np.asarray(scales)[:, None]
-    noise = np.array([io.noise_estimate(R_data, data[i]) for i in range(data.shape[0])])
+    if M.is_chik(data):
+        noise = data.noise(S.window)
+    else:
+        noise = np.array([io.noise_estimate(R_data, tgt[i]) for i in range(tgt.shape[0])])
     bands = ((0.6, 1.2), (1.2, 1.4), (1.4, 1.8), (1.8, 2.6), (2.6, 3.3),
              (3.3, 4.1), (4.1, 4.2), (4.2, 4.8), (4.8, 5.0), (5.0, 5.6),
              (5.6, 8.0))
     rows = []
     for lo, hi in bands:
         b = (R_data >= lo) & (R_data < hi)
-        rf = [float(((m[i][b] - data[i][b]) ** 2).sum()
-                    / max((data[i][b] ** 2).sum(), 1e-30)) for i in range(data.shape[0])]
-        snr = [float(data[i][b].mean() / noise[i]) for i in range(data.shape[0])]
+        rf = [float((np.abs(m[i][b] - tgt[i][b]) ** 2).sum()
+                    / max((np.abs(tgt[i][b]) ** 2).sum(), 1e-30))
+              for i in range(tgt.shape[0])]
+        snr = [float(np.abs(tgt[i][b]).mean() / noise[i]) for i in range(tgt.shape[0])]
         rows.append(dict(r_lo=lo, r_hi=hi, r_factor=rf, data_over_noise=snr,
                          in_fit=bool(lo >= FIT_RMIN and hi <= FIT_RMAX)))
     return rows

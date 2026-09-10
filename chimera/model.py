@@ -40,6 +40,28 @@ spectra:
 The species configuration is NOT part of the calibration: it is fitted
 afterwards, with these held fixed.
 
+Two kinds of target
+-------------------
+The comparison happens in R space either way, but what is compared depends on
+what was measured (see `chik.py`):
+
+    |chi(R)| files   the model's chi(k) is transformed against each edge's
+                     experimental k axis and its MAGNITUDE compared on the
+                     data grid. The window and k weight are calibration
+                     parameters, because they were the experimenters' choices
+                     and are not recorded.
+    chi(k) files     the data are transformed with the SAME window and k
+                     weight(s) as the model and the COMPLEX chi(R) is compared,
+                     Re and Im. The window is then our choice, and several k
+                     weights can be fitted at once: each (edge, k weight) pair
+                     is one CHANNEL of the target, ordered edge-major
+                     (`chan_edge` gives the edge of every channel), with the
+                     per-edge amplitude profiled over all channels of an edge.
+
+`target(data, S)` produces the array to compare against for either kind and
+`observe(S, species, target)` the matching model array; `fit_scales`,
+`chi2` and `r_factor` accept both real and complex arrays.
+
 Cheap parameter updates
 -----------------------
 The expensive pieces (neighbour list, force-constant eigendecomposition) do
@@ -59,6 +81,8 @@ from exafs_gpu.lattice import (CrystalSupercell, force_constant_matrix,
 from exafs_gpu.forward import ForwardModel, thermal_sigma2
 from exafs_gpu.fourier import FourierTransform
 from . import multiscat
+from .chik import (ChiK, Window, as_kweights, kweight_value, channel_edges,
+                   channel_labels, make_window)
 
 ETOK = 0.2624682843        # k^2 [A^-2] per eV
 NKMODEL = 320
@@ -192,21 +216,43 @@ class Spectrum:
         return float(self.sigma2[np.abs(d - self.shells[0]) < 0.05].mean())
 
     def set_window(self, kmin=None, kmax=None, kweight=None, dE0=None):
+        """Window, k weight(s) and per-edge E0. `kweight` may be one integer
+        or several; every (edge, k weight) pair becomes one transform, and
+        `chan_edge` records the edge of each."""
         if kmin is not None:
             self.kmin = float(kmin)
         if kmax is not None:
             self.kmax = float(kmax)
         if kweight is not None:
-            self.kweight = int(kweight)
+            self.kweights = as_kweights(kweight)
         if dE0 is not None:
             self.dE0 = np.atleast_1d(np.asarray(dE0, float)) * np.ones(NSP)
         self.ft = []
         for e in range(NSP):
-            k_exp = np.sqrt(np.maximum(self.k_phys ** 2 - ETOK * self.dE0[e], 1e-4))
-            self.ft.append(FourierTransform(k_exp, self.kmin, self.kmax,
-                                            self.kweight, dk_win=self.dk_win, xp=cp))
+            k_exp = self.k_exp(e)
+            for w in self.kweights:
+                self.ft.append(FourierTransform(k_exp, self.kmin, self.kmax, w,
+                                                dk_win=self.dk_win, xp=cp))
+        self.chan_edge = channel_edges(NSP, len(self.kweights))
+        self.nchan = len(self.ft)
         self.R = self.ft[0].R
         return self
+
+    @property
+    def kweight(self):
+        """The int for a single k weight, a list for several (JSON form)."""
+        return kweight_value(self.kweights)
+
+    @property
+    def window(self):
+        return Window(self.kmin, self.kmax, self.kweights, self.dk_win)
+
+    def k_exp(self, e):
+        """The experimental k axis of edge e (its E0 error applied)."""
+        return k_exp_axis(self.k_phys, self.dE0[e])
+
+    def channel_labels(self):
+        return channel_labels(ELEMENTS, self.kweights)
 
     def params(self):
         return dict(a0=self.a0, dE0=[float(x) for x in self.dE0],
@@ -233,8 +279,7 @@ class Spectrum:
         return cls(**kw)
 
     # ------------------------------------------------------------- evaluation
-    def chi_R(self, species, pos=None):
-        """|chi(R)| (nsp, nR) for one configuration, indexed by ABSORBER."""
+    def _chi_device(self, species, pos=None):
         sp = cp.asarray(np.atleast_2d(np.asarray(species, np.int32)))
         if pos is None:
             p = self._pos
@@ -243,8 +288,23 @@ class Spectrum:
         chi = self.fm.chi(p, sp)          # (1, nsp, nk), indexed by absorber
         if self.chi_ms is not None:
             chi = chi + cp.asarray(self.chi_ms)[None]
-        out = [cp.asnumpy(self.ft[e].magnitude(chi[:, e:e + 1]))[0, 0]
-               for e in range(NSP)]
+        return chi
+
+    def chi_k(self, species, pos=None):
+        """chi(k) (nsp, nk) on the PHYSICAL momentum grid `k_phys`, indexed by
+        absorber, multiple scattering included. Plot edge e against
+        `k_exp(e)` to put it on the experiment's axis."""
+        return cp.asnumpy(self._chi_device(species, pos))[0]
+
+    def chi_R(self, species, pos=None, complex_out=False):
+        """chi(R) (nchan, nR) for one configuration: |chi(R)| by default, the
+        complex transform with `complex_out`. Channels are (edge, k weight)
+        pairs, edge-major - one per edge for a single k weight."""
+        chi = self._chi_device(species, pos)
+        out = []
+        for f, e in zip(self.ft, self.chan_edge):
+            z = f.to_R(chi[:, e:e + 1])[0, 0]
+            out.append(cp.asnumpy(z if complex_out else cp.abs(z)))
         return np.array(out)
 
     def random_config(self, seed=0, composition=(1 / 3, 1 / 3, 1 / 3)):
@@ -268,24 +328,71 @@ def match_grid(R_model, R_data):
     return idx
 
 
-def fit_scales(model_mag, data_mag, mask):
-    """Least-squares amplitude per edge (closed form)."""
-    num = (model_mag[:, mask] * data_mag[:, mask]).sum(axis=1)
-    den = (model_mag[:, mask] ** 2).sum(axis=1)
+def target(data, window):
+    """The array a fit compares against.
+
+    A |chi(R)| array is returned as given. A `ChiK` is transformed with
+    `window` - a Spectrum, ShellModel or Window - into complex chi(R) on the
+    model's own R grid, so `match_grid(S.R, data.R)` is the identity and the
+    fit mask is taken on that grid.
+    """
+    if isinstance(data, ChiK):
+        return data.to_R(make_window(window))
+    return np.asarray(data)
+
+
+def is_chik(data):
+    return isinstance(data, ChiK)
+
+
+def observe(S, species, target, pos=None):
+    """The model array on the same footing as `target` (real or complex)."""
+    return S.chi_R(species, pos=pos, complex_out=np.iscomplexobj(target))
+
+
+def fit_scales(model, data, mask, edge=None):
+    """Least-squares amplitude per channel (closed form), real or complex.
+
+    With `edge` (the edge index of every channel) one amplitude is fitted per
+    EDGE over all of its channels and broadcast back to the channels, so
+    several k weights of the same edge share their S0^2.
+    """
+    m, d = model[:, mask], data[:, mask]
+    num = np.real((np.conj(m) * d).sum(axis=1))
+    den = np.real((np.conj(m) * m).sum(axis=1))
+    if edge is not None:
+        edge = np.asarray(edge, int)
+        ne = int(edge.max()) + 1
+        num = np.bincount(edge, num, ne)[edge]
+        den = np.bincount(edge, den, ne)[edge]
     return num / np.maximum(den, 1e-30)
 
 
-def chi2(model_mag, data_mag, mask, sigma, scales=None):
-    m = model_mag if scales is None else model_mag * np.asarray(scales)[:, None]
-    d = (m[:, mask] - data_mag[:, mask]) / np.asarray(sigma)[:, None]
-    return float((d ** 2).sum() / d.size)
+def edge_scales(scales, edge=None):
+    """One value per edge from per-channel scales (the first channel of each)."""
+    scales = np.asarray(scales, float)
+    if edge is None:
+        return scales
+    edge = np.asarray(edge, int)
+    first = [int(np.argmax(edge == e)) for e in range(int(edge.max()) + 1)]
+    return scales[first]
 
 
-def r_factor(model_mag, data_mag, mask, scales=None):
-    """Standard EXAFS R factor: sum (data-fit)^2 / sum data^2, over the fit range."""
-    m = model_mag if scales is None else model_mag * np.asarray(scales)[:, None]
-    num = ((m[:, mask] - data_mag[:, mask]) ** 2).sum()
-    den = (data_mag[:, mask] ** 2).sum()
+def chi2(model, data, mask, sigma, scales=None):
+    """Mean squared residual in units of sigma, counted per REAL component:
+    a complex target contributes Re and Im separately and sigma is the
+    per-component sd."""
+    m = model if scales is None else model * np.asarray(scales)[:, None]
+    d = (m[:, mask] - data[:, mask]) / np.asarray(sigma)[:, None]
+    n = d.size * (2 if np.iscomplexobj(d) else 1)
+    return float((np.abs(d) ** 2).sum() / n)
+
+
+def r_factor(model, data, mask, scales=None):
+    """EXAFS R factor: sum |data - fit|^2 / sum |data|^2 over the fit range."""
+    m = model if scales is None else model * np.asarray(scales)[:, None]
+    num = (np.abs(m[:, mask] - data[:, mask]) ** 2).sum()
+    den = (np.abs(data[:, mask]) ** 2).sum()
     return float(num / max(den, 1e-30))
 
 

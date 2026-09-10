@@ -26,6 +26,14 @@ Moves are species swaps only (`swap_frac=1.0`): the atoms stay on ideal FCC
 sites and all displacement disorder is carried by the Debye-Waller factor.
 That is what "keep the sample FCC" means operationally, and it also avoids
 fitting 1500 coordinates to ~54 independent data points.
+
+`data` may be a |chi(R)| array on `R_data` or a `chik.ChiK` (measured
+chi(k)). In the second case the target is the COMPLEX chi(R) obtained with
+the Spectrum's own window and k weight(s), on the Spectrum's R grid (so
+`R_data = data.R` and `idx` is the identity); every quantity below - the
+sampler's sigma, the R-factor, the Cramer-Rao bounds - then counts Re and Im
+as separate residuals. The result records `target_complex` and `kweights` so
+the two kinds of fit are never confused downstream.
 """
 from __future__ import annotations
 import numpy as np
@@ -93,26 +101,35 @@ def fit_one(S, R_data, data, idx, mask_d, a0_guess, sig_guess, seeds=(0, 1),
     `profile_scale` profile the per-edge amplitude inside the sampler's chi^2
     `collect_beta`  rung (inverse temperature) posterior samples come from;
                     0.5 is the likelihood temperature, None the coldest rungs
-    `noise`         per-edge measurement noise for the noise-only bound
-                    (default: estimated from the R > 7.5 A tail of the data)
+    `noise`         per-channel measurement noise for the noise-only bound
+                    (default: estimated from the structureless high-R band)
+    `data`          a |chi(R)| array on R_data, or a ChiK (see module docstring)
     """
     cfg0 = S.random_config(0)
+    tgt = M.target(data, S)                 # |chi(R)| as given, or complex chi(R)
+    cplx = np.iscomplexobj(tgt)
+    assert tgt.shape[0] == S.nchan, (
+        f"target has {tgt.shape[0]} channels but the model {S.nchan}: several "
+        f"k weights need chi(k) data")
     if refine and (free_a0 or free_sigma):
         a0, ss, r_ideal = refine_local(S, cfg0, idx, data, mask_d, a0_guess,
                                        sig_guess, free_a0, free_sigma)
     else:
         S.set_a0(a0_guess); S.set_sigma_scale(sig_guess)
         a0, ss = a0_guess, sig_guess
-        m = S.chi_R(cfg0)[:, idx]
-        r_ideal = M.r_factor(m, data, mask_d, M.fit_scales(m, data, mask_d))
+        m = M.observe(S, cfg0, tgt)[:, idx]
+        r_ideal = M.r_factor(m, tgt, mask_d, M.fit_scales(m, tgt, mask_d, S.chan_edge))
 
-    m0 = S.chi_R(cfg0)[:, idx]
-    scales = M.fit_scales(m0, data, mask_d)
+    m0 = M.observe(S, cfg0, tgt)[:, idx]
+    scales = M.fit_scales(m0, tgt, mask_d, S.chan_edge)
     # sigma for the sampler: the residual the IDEAL model leaves, i.e. the
     # model error, since that dominates the measurement noise by ~5x here.
-    sig_data = np.sqrt((((m0 * scales[:, None]) - data)[:, mask_d] ** 2).mean(1))
+    # For a complex target this is the per-COMPONENT sd (Re and Im).
+    resid0 = (m0 * scales[:, None] - tgt)[:, mask_d]
+    sig_data = np.sqrt((np.abs(resid0) ** 2).mean(1) / (2.0 if cplx else 1.0))
     sig = sig_data / scales
-    target = np.zeros((NSP, S.R.size)); target[:, idx] = data / scales[:, None]
+    target = np.zeros((S.nchan, S.R.size), complex if cplx else float)
+    target[:, idx] = tgt / scales[:, None]
     mask = np.zeros(S.R.size, bool); mask[idx] = mask_d
     sigR = np.repeat(sig[:, None], S.R.size, axis=1)
     ft = MultiEdgeFT.from_spectrum(S)
@@ -144,15 +161,16 @@ def fit_one(S, R_data, data, idx, mask_d, a0_guess, sig_guess, seeds=(0, 1),
     W = np.array(W)
     spb, posb = best[0], best[2]
     rms_disp = float(np.sqrt(((posb - S.cell.ideal) ** 2).sum(1).mean()))
-    model_mag = S.chi_R(spb, pos=posb)[:, idx]
-    sc_fit = M.fit_scales(model_mag, data, mask_d)
+    model_R = M.observe(S, spb, tgt, pos=posb)[:, idx]
+    sc_fit = M.fit_scales(model_R, tgt, mask_d, S.chan_edge)
     # R-factor on a COMMON range, so variants fitted over different windows
     # can be compared: a narrower fit range always looks better on its own.
     if eval_mask is None:
         r_common = None
     else:
-        sc_c = M.fit_scales(model_mag, data, eval_mask)
-        r_common = float(M.r_factor(model_mag, data, eval_mask, sc_c))
+        sc_c = M.fit_scales(model_R, tgt, eval_mask, S.chan_edge)
+        r_common = float(M.r_factor(model_R, tgt, eval_mask, sc_c))
+    fit_R, ideal_R = model_R * sc_fit[:, None], m0 * scales[:, None]
     res = dict(
         a0=a0, nn_distance=float(S.shells[0]), sigma_scale=ss,
         sigma_shell_scale=S.sigma_shell_scale.tolist(), dr=S.dr.tolist(),
@@ -161,11 +179,18 @@ def fit_one(S, R_data, data, idx, mask_d, a0_guess, sig_guess, seeds=(0, 1),
         multiple_scattering=bool(getattr(S, "chi_ms", None) is not None),
         ms_amp=getattr(S, "ms_amp", None), ms_c=getattr(S, "ms_c", None),
         sigma2_nn=float(_nn_sigma2(S)), shells=[float(x) for x in S.shells],
-        scales=sc_fit.tolist(), chi2_start=chi2_0,
+        scales=M.edge_scales(sc_fit, S.chan_edge).tolist(), chi2_start=chi2_0,
         chi2=float(np.mean(chi2s)), chi2_seeds=chi2s,
         r_factor_ideal=float(r_ideal),
-        r_factor=float(M.r_factor(model_mag, data, mask_d, sc_fit)),
+        r_factor=float(M.r_factor(model_R, tgt, mask_d, sc_fit)),
         r_factor_common=r_common,
+        target_complex=bool(cplx), kweights=list(S.kweights),
+        channels=S.channel_labels(), n_fit=int(mask_d.sum() * S.nchan * (2 if cplx else 1)),
+        # Stern's count per edge; extra k-weight channels re-weight the same
+        # information, and a magnitude carries about half of it
+        n_independent=float(NSP * (2 * (S.kmax - S.kmin)
+                                   * (R_data[mask_d].max() - R_data[mask_d].min())
+                                   / np.pi + 2) / (1.0 if cplx else 2.0)),
         wc=W.mean(0).tolist(), wc_sd_seeds=W.std(0).tolist(),
         wc_posterior_sd=(np.std(post, axis=0).tolist() if post else None),
         wc_posterior_mean=(np.mean(post, axis=0).tolist() if post else None),
@@ -174,12 +199,29 @@ def fit_one(S, R_data, data, idx, mask_d, a0_guess, sig_guess, seeds=(0, 1),
         species=spb.astype(np.int8).tolist(),
         positions=(posb - S.cell.ideal).astype(np.float32).round(4).tolist()
         if swap_frac < 1.0 else None,
-        model_mag=(model_mag * sc_fit[:, None]).tolist(),
-        ideal_mag=((m0 * scales[:, None]).tolist()),
+        model_mag=np.abs(fit_R).tolist(),
+        ideal_mag=np.abs(ideal_R).tolist(),
     )
+    if cplx:
+        res.update(model_re=fit_R.real.tolist(), model_im=fit_R.imag.tolist(),
+                   ideal_re=ideal_R.real.tolist(), ideal_im=ideal_R.imag.tolist())
     if crlb:
         res.update(crlb_bounds(S, spb, R_data, data, idx, mask_d, sig_data, noise))
     return res
+
+
+MODEL_ARRAY_KEYS = ("model_mag", "ideal_mag", "model_re", "model_im", "ideal_re",
+                    "ideal_im")
+
+
+def model_arrays(res):
+    """(fit, ideal) chi(R) arrays from a result dict: complex when the fit
+    was against chi(k) data, |chi(R)| otherwise."""
+    if "model_re" in res:
+        fit = np.array(res["model_re"]) + 1j * np.array(res["model_im"])
+        ideal = np.array(res["ideal_re"]) + 1j * np.array(res["ideal_im"])
+        return fit, ideal
+    return np.array(res["model_mag"]), np.array(res["ideal_mag"])
 
 
 def crlb_bounds(S, species, R_data, data, idx, mask_d, sigma_model, noise=None,
@@ -190,15 +232,21 @@ def crlb_bounds(S, species, R_data, data, idx, mask_d, sigma_model, noise=None,
     level the fit actually has (the honest one, `wc_crlb`); the first shell
     alone (`wc_crlb_shell1_only`, the best case for this data); and all
     shells free at the measurement-noise level (`wc_crlb_noise`, what a
-    perfect model would allow).
+    perfect model would allow). The noise comes from the structureless
+    high-R band of the data: 7.5 A up for a |chi(R)| file that stops at
+    10 A, 15-25 A for the transform of chi(k) (Larch's convention).
     """
     sm = SM.ShellModel.from_spectrum(S)
     N = sm.counts_of(species)
+    tgt = M.target(data, S)
     if noise is None:
-        noise = np.array([io.noise_estimate(R_data, data[e]) for e in range(NSP)])
-    b_all = SM.crlb(sm, N, data, sigma_model, mask_d, idx, threshold=threshold)
-    b_s1 = SM.crlb(sm, N, data, sigma_model, mask_d, idx, shells=[0], threshold=threshold)
-    b_noise = SM.crlb(sm, N, data, noise, mask_d, idx, threshold=threshold)
+        if M.is_chik(data):
+            noise = data.noise(S.window)
+        else:
+            noise = np.array([io.noise_estimate(R_data, tgt[c]) for c in range(tgt.shape[0])])
+    b_all = SM.crlb(sm, N, tgt, sigma_model, mask_d, idx, threshold=threshold)
+    b_s1 = SM.crlb(sm, N, tgt, sigma_model, mask_d, idx, shells=[0], threshold=threshold)
+    b_noise = SM.crlb(sm, N, tgt, noise, mask_d, idx, threshold=threshold)
     return dict(wc_crlb=b_all["alpha_sd"], wc_crlb_shell1_only=b_s1["alpha_sd"],
                 wc_crlb_noise=b_noise["alpha_sd"], wc_determined=b_all["determined"],
                 crlb_threshold=threshold, sigma_noise=np.asarray(noise).tolist(),
@@ -242,6 +290,11 @@ def systematic_band(R_data, data, cal, seeds=(0,), nsteps=6000, nrep=48,
     Every variant is a choice the data cannot distinguish - they all fit to
     within a few percent in R-factor - so the range of Warren-Cowley values
     they produce is the honest uncertainty on those parameters.
+
+    With chi(k) data the k-weight and k-window variants re-transform the data
+    as well as the model (the window is then a weighting we choose, not a
+    property of the files), so they probe the model's robustness rather than
+    an unknown processing choice.
     """
     rows = []
     common = (R_data > cal["rmin"]) & (R_data < cal["rmax"])

@@ -34,7 +34,8 @@ import numpy as np
 from exafs_gpu.fourier import FourierTransform
 from exafs_gpu.scattering import NSP
 from . import multiscat
-from .model import k_exp_axis, fit_scales, r_factor
+from .model import k_exp_axis, fit_scales, edge_scales, r_factor, target as _target
+from .chik import Window, as_kweights, kweight_value, channel_edges
 
 PARAM_NAMES = ("a0", "dE0", "kmin", "kmax", "kweight", "sigma_scale",
                "sigma_shell_scale", "dr", "c3", "ms_amp", "ms_c")
@@ -100,7 +101,7 @@ class ShellModel:
         self.dk_win = float(dk_win)
         self.pairs = pairs                      # (i_idx, j_idx, shell_idx)
         self.p = dict(a0=self.a0_ref, dE0=np.zeros(self.nsp), kmin=3.0, kmax=13.0,
-                      kweight=3, sigma_scale=1.0,
+                      kweight=(3,), sigma_scale=1.0,
                       sigma_shell_scale=np.ones(self.nshell),
                       dr=np.zeros((self.nsp, self.nsp)), c3=np.zeros(self.nshell),
                       ms_amp=1.0, ms_c=1.3)
@@ -113,7 +114,7 @@ class ShellModel:
         m = cls(S.k_phys, S.tables, S.shells_ref, S.shell_mult, S.sigma2_shell_ref,
                 S.cell.natoms, a0_ref=S.a0_ref, ms_paths=S.ms_paths, s02=S.s02,
                 dk_win=S.dk_win, pairs=(S.i, S.j, S.shell_idx))
-        m.set_params(a0=S.a0, dE0=S.dE0, kmin=S.kmin, kmax=S.kmax, kweight=S.kweight,
+        m.set_params(a0=S.a0, dE0=S.dE0, kmin=S.kmin, kmax=S.kmax, kweight=S.kweights,
                      sigma_scale=S.sigma_scale, sigma_shell_scale=S.sigma_shell_scale,
                      dr=S.dr, c3=S.c3, ms_amp=getattr(S, "ms_amp", 1.0),
                      ms_c=getattr(S, "ms_c", 1.3))
@@ -133,7 +134,7 @@ class ShellModel:
     def params(self):
         p = self.p
         return dict(a0=p["a0"], dE0=p["dE0"].tolist(), kmin=p["kmin"], kmax=p["kmax"],
-                    kweight=p["kweight"], sigma_scale=p["sigma_scale"],
+                    kweight=kweight_value(p["kweight"]), sigma_scale=p["sigma_scale"],
                     sigma_shell_scale=p["sigma_shell_scale"].tolist(),
                     dr=p["dr"].tolist(), c3=p["c3"].tolist(),
                     ms_amp=p["ms_amp"], ms_c=p["ms_c"],
@@ -157,11 +158,24 @@ class ShellModel:
                 v = np.zeros(self.nshell)
                 v[:min(c.size, self.nshell)] = c[:self.nshell]
             elif key == "kweight":
-                v = int(v)
+                v = as_kweights(v)
             else:
                 v = float(v)
             self.p[key] = v
         return self
+
+    @property
+    def window(self):
+        p = self.p
+        return Window(p["kmin"], p["kmax"], p["kweight"], self.dk_win)
+
+    @property
+    def chan_edge(self):
+        return channel_edges(self.nsp, len(self.p["kweight"]))
+
+    @property
+    def nchan(self):
+        return self.nsp * len(self.p["kweight"])
 
     # ------------------------------------------------------------ geometry
     def radii(self):
@@ -205,12 +219,13 @@ class ShellModel:
         return self._ms
 
     def fts(self):
+        """One transform per channel: (edge, k weight) pairs, edge-major."""
         p = self.p
         key = (p["dE0"].tobytes(), p["kmin"], p["kmax"], p["kweight"])
         if self._ft_key != key:
             self._ft = [FourierTransform(k_exp_axis(self.k, p["dE0"][e]), p["kmin"],
-                                         p["kmax"], p["kweight"], dk_win=self.dk_win,
-                                         xp=np) for e in range(self.nsp)]
+                                         p["kmax"], w, dk_win=self.dk_win, xp=np)
+                        for e in range(self.nsp) for w in p["kweight"]]
             self._ft_key = key
         return self._ft
 
@@ -255,17 +270,32 @@ class ShellModel:
         cnt = np.maximum(self.absorber_counts(N), 1e-30)
         return np.einsum("abs,absk->ak", N, self.basis()) / cnt[:, None] + self.chi_ms()
 
-    def mag_R(self, N, idx=None):
-        """|chi(R)| per edge on the FFT grid, or on the data grid via idx."""
+    def chi_R(self, N, idx=None):
+        """Complex chi(R) per channel on the FFT grid, or on the data grid via idx."""
         chi = self.chi_k(N)
-        out = np.array([ft.magnitude(chi[e]) for e, ft in enumerate(self.fts())])
+        out = np.array([ft.to_R(chi[e]) for ft, e in zip(self.fts(), self.chan_edge)])
         return out if idx is None else out[:, idx]
 
+    def mag_R(self, N, idx=None):
+        """|chi(R)| per channel on the FFT grid, or on the data grid via idx."""
+        return np.abs(self.chi_R(N, idx))
+
+    def target(self, data):
+        """The comparison array for `data` (a |chi(R)| array or a ChiK), see
+        `model.target`; a ChiK is transformed with this model's window."""
+        return _target(data, self.window)
+
+    def observe(self, N, tgt, idx=None):
+        return self.chi_R(N, idx) if np.iscomplexobj(tgt) else self.mag_R(N, idx)
+
     def r_factor(self, N, data, mask, idx, return_scales=False):
-        m = self.mag_R(N, idx)
-        sc = fit_scales(m, data, mask)
-        rf = r_factor(m, data, mask, sc)
-        return (rf, sc) if return_scales else rf
+        """R-factor of the pair counts N against `data`, with one amplitude
+        per edge profiled out. Returns the per-edge amplitudes on request."""
+        d = self.target(data)
+        m = self.observe(N, d, idx)
+        sc = fit_scales(m, d, mask, self.chan_edge)
+        rf = r_factor(m, d, mask, sc)
+        return (rf, edge_scales(sc, self.chan_edge)) if return_scales else rf
 
 
 # ================================================================ Fisher
@@ -279,11 +309,13 @@ def crlb(model, N, data, sigma, mask, idx, shells=None, alpha_shell=0,
          threshold=0.3, steps=None, prior_sd=None):
     """Cramer-Rao bounds on the shell-`alpha_shell` Warren-Cowley parameters.
 
-    Linearises |chi(R)| around the pair counts N along the SRO directions of
-    every shell in `shells` (default: all - which is what the sampler frees),
-    plus the nuisance parameters, at noise level `sigma` (per edge, or per
-    edge and R point, in DATA units). The per-edge amplitude is profiled out
-    exactly as in the fit.
+    Linearises the target - |chi(R)|, or complex chi(R) for chi(k) data, in
+    which case Re and Im are separate residuals - around the pair counts N
+    along the SRO directions of every shell in `shells` (default: all - which
+    is what the sampler frees), plus the nuisance parameters, at noise level
+    `sigma` (per channel, or per channel and R point, in DATA units; the
+    per-component sd for a complex target). The per-edge amplitude is
+    profiled out exactly as in the fit. `data` may be the array or a ChiK.
 
     The nuisances matter: the bond offsets dr and the per-edge E0 can mimic
     part of a short-range-order signal (a Cr-avoiding arrangement shortens
@@ -305,6 +337,10 @@ def crlb(model, N, data, sigma, mask, idx, shells=None, alpha_shell=0,
     """
     nsp, nshell = model.nsp, model.nshell
     shells = list(range(nshell)) if shells is None else list(shells)
+    data = model.target(data)
+    cplx = np.iscomplexobj(data)
+    nchan, chan_edge = model.nchan, model.chan_edge
+    assert data.shape[0] == nchan, f"target has {data.shape[0]} channels, model {nchan}"
     sig = np.asarray(sigma, float)
     if sig.ndim == 1:
         sig = np.repeat(sig[:, None], data.shape[1], axis=1)
@@ -320,9 +356,10 @@ def crlb(model, N, data, sigma, mask, idx, shells=None, alpha_shell=0,
         pr.update(prior_sd)
 
     def resid(Nx):
-        m = model.mag_R(Nx, idx)
-        sc = fit_scales(m, data, mask) if profile_scale else np.ones(nsp)
-        return ((m * sc[:, None] - data)[:, mask] / sig[:, mask]).ravel()
+        m = model.observe(Nx, data, idx)
+        sc = fit_scales(m, data, mask, chan_edge) if profile_scale else np.ones(nchan)
+        r = (m * sc[:, None] - data)[:, mask] / sig[:, mask]
+        return np.concatenate([r.real.ravel(), r.imag.ravel()]) if cplx else r.ravel()
 
     cols, A, names, prec = [], [], [], []
     for s in shells:
