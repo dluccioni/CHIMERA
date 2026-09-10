@@ -3,21 +3,28 @@
 **CHI-space Multi-Edge Reconstruction of Alloys**
 
 Reconstructs the atomic configuration of a substitutional alloy from
-multi-edge EXAFS `|chi(R)|`, and reports Warren-Cowley short-range-order
-parameters and partial radial distribution functions with a systematic
-uncertainty budget.
+multi-edge EXAFS — measured `chi(k)`, or `|chi(R)|` when that is all there
+is — and reports Warren-Cowley short-range-order parameters and partial
+radial distribution functions with a systematic uncertainty budget.
 
 ## What it does
 
-* Reads `|chi(R)|` per absorption edge and per sample position, screens it for
-  quality, and forms position medians.
-* Infers the processing parameters the files no longer record — E0 per edge,
-  the k window and k weight — together with the lattice constant, the
-  Debye-Waller scales, the pair-type bond-length offsets and the first-shell
-  third cumulant, by a global fit of the random-alloy model to the data.
+* Reads `chi(k)` or `|chi(R)|` per absorption edge and per sample position
+  (the kind is read off the files), screens it for quality, and forms
+  position medians.
+* With `chi(k)`, transforms data and model with one window of our choosing
+  and fits the **complex** `chi(R)` — Re and Im — with as many k weights at
+  once as asked for (`k^1, k^2, k^3` together by default). The phase pins E0
+  and the distances, which is what separates `sigma^2` from the
+  short-range order; `|chi(R)|` alone cannot (see `chimera/chik.py`).
+* With `|chi(R)|`, infers the processing parameters the files no longer
+  record — E0 per edge, the k window and k weight — together with the
+  lattice constant, the Debye-Waller scales, the pair-type bond-length
+  offsets and the first-shell third cumulant, by a global fit of the
+  random-alloy model to the data.
 * Forward-models `chi(k)` on the GPU from a supercell (500 atoms by default)
   using FEFF8L scattering tables, adds the FEFF8L multiple-scattering paths,
-  and transforms with the same window the experiment used.
+  and transforms with the same window as the data.
 * Samples species configurations by parallel-tempering reverse Monte Carlo,
   with an incremental delta-chi so a move costs about 1/125 of a full
   recomputation.
@@ -60,36 +67,51 @@ recording the cluster they were computed for. Point the model at them with
 ```python
 from chimera import dataio as io, calibrate as C, model as M, fitrun as F
 
-spectra, report = io.screen("path/to/data")     # per-edge |chi(R)|, screened
+spectra, report = io.screen("path/to/data")     # per-edge chi(k) or |chi(R)|, screened
 R_data = spectra[(0, "Cr")]["R"]                # the common R grid
 
-cal, S = C.calibrate(spectra, R_data)           # E0/edge, k window and weight,
-                                                # a0, sigma^2 scales, dr, C3, MS
+cal, S = C.calibrate(spectra, R_data)           # E0/edge, a0, sigma^2 scales, dr,
+                                                # C3, MS (+ window and k weight
+                                                # when only |chi(R)| is available)
 
 c    = cal[0]                                   # calibration for series point 0
 S    = M.Spectrum.from_cal(c)
 idx  = M.match_grid(S.R, R_data)
 mask = C.fit_mask(R_data, c["rmin"], c["rmax"])
 
-res = F.fit_one(S, R_data, io.average(spectra, 0), idx, mask,
-                c["a0"], c["sigma_scale"], seeds=(0, 1))
+data = io.fit_input(spectra, 0)                 # a ChiK, or the |chi(R)| median
+res  = F.fit_one(S, R_data, data, idx, mask,
+                 c["a0"], c["sigma_scale"], seeds=(0, 1))
 
 res["wc"]        # Warren-Cowley alpha, one per unordered pair
 res["wc_crlb"]   # Cramer-Rao bound on each, at this fit's residual level
 res["r_factor"]
+res["target_complex"], res["kweights"]   # what was fitted
 ```
+
+`chi(k)` arrays from anywhere else go in as `chik.ChiK(k, chi)` (one row per
+edge, in `ELEMENTS` order); `R_data` is then `data.R`, the model's own grid.
+`S.set_window(kweight=(1, 2, 3))` fits several k weights at once.
 
 `F.systematic_band(...)` re-fits under each admissible calibration variant and
 returns the spread — the part of the uncertainty the data cannot resolve.
 `F.broadened_partial_rdf(...)` and `F.shell_table(...)` turn a fitted
 configuration into `g_AB(r)` and per-shell coordination numbers.
 
+Athena project files are read by `scripts/export_athena.py`, which needs a
+Python with `xraylarch` (passed as `--larch-python`, as for the tables) and
+writes `k, chi` files in the layout above plus a `processing.json` with the
+E0, background and normalisation Athena used.
+
 ## Layout
 
 ```
 chimera/
-  dataio.py        loading, quality screening, per-position grouping
-  model.py         configuration -> |chi(R)|; cheap calibration updates
+  dataio.py        loading (chi(k) or |chi(R)| files), quality screening,
+                   per-position grouping
+  chik.py          chi(k) data: the shared transform to complex chi(R),
+                   k-weight channels, R-space noise
+  model.py         configuration -> chi(k) -> chi(R); cheap calibration updates
   shellmodel.py    the same model in pair-count space (CPU, exact for swap-only
                    fits): calibration objective, Cramer-Rao bounds on alpha
   multiscat.py     FEFF8L multiple-scattering paths (3- and 4-leg)
@@ -127,10 +149,13 @@ feff8l_tables.py   generates data/ for an alloy (needs xraylarch)
   neighbour-list machinery and the MC proposal kernels assume a uniform
   coordination number.
 * **Input layout.** `dataio.screen` expects `<Element>_<N><tag>/…sample<M>.csv`
-  with columns `R, chi_mag`, where `<N>` indexes a series (pressure,
-  temperature, composition) and `<M>` a position on the sample. Data arranged
-  otherwise can be handed to `calibrate` and `fit_one` directly — they take
-  arrays, not paths.
+  with columns `k, chi` (measured chi(k); Athena's `.chi` files with a `#`
+  header are read too) or `R, chi_mag` (magnitude only), where `<N>` indexes
+  a series (pressure, temperature, composition) and `<M>` a position on the
+  sample. A folder holds one kind on one grid. Data arranged otherwise can
+  be handed to `calibrate` and `fit_one` directly — they take arrays or
+  `ChiK` objects, not paths. Raw `mu(E)` is not read: take it through
+  Athena / Larch (or `scripts/export_athena.py`) to `chi(k)` first.
 * **Composition** is conserved by construction: moves are species swaps, so a
   fit cannot drift away from the composition you set.
 
@@ -148,8 +173,19 @@ feff8l_tables.py   generates data/ for an alloy (needs xraylarch)
   (1/n)^8 for n equiatomic species — the proposal falls through to a small
   displacement. Over a full run that leaves an RMS drift under 3 mA, about 2%
   of sigma.
-* Fitting is done against `|chi(R)|` over a windowed R range; the R-factor
-  quoted everywhere is `sum (fit - data)^2 / sum data^2` on that window.
+* Fitting is done in R space over a windowed R range, against the complex
+  `chi(R)` when `chi(k)` was measured and against `|chi(R)|` otherwise; the
+  R-factor quoted everywhere is `sum |fit - data|^2 / sum |data|^2` on that
+  window. A complex target counts Re and Im as separate residuals: `chi^2`
+  divides by twice the number of points, the sampler's `nfit` does the same,
+  and every noise or model-error sigma is the per-component value. Results
+  record `target_complex` and `kweights`.
+* Several k weights are fitted as extra channels: `chi_R(...)` returns one
+  row per (edge, k weight), edge-major, `S.chan_edge` names the edge of each,
+  and the profiled amplitude is one value per edge over all its channels.
+* With `chi(k)` the window is a choice applied to data and model alike, so
+  `calibrate` does not search it, and `anchor_a0=False` is allowed (the
+  phase separates a0 from E0). From `|chi(R)|` alone both remain as before.
 * With atoms on ideal sites, chi depends on the configuration only through the
   pair counts per shell, `N[absorber, scatterer, shell]`. `shellmodel` uses
   that: the calibration objective and the alpha bounds run on the CPU in
