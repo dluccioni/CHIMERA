@@ -27,44 +27,119 @@ plt.rcParams.update({
 })
 
 
+def _channel_titles(n, labels):
+    if labels is not None:
+        return list(labels)
+    if n == len(ELEMENTS):
+        return [f"{e} edge" for e in ELEMENTS]
+    return [f"channel {i}" for i in range(n)]
+
+
 def fit_comparison(path, R, data, model, ideal, mask, title, r_factor,
-                   r_factor_ideal, shells=None, spread=None):
-    """Three panels (one per edge): data, reconstruction, and residual."""
+                   r_factor_ideal, shells=None, spread=None, labels=None):
+    """One column per channel: data, reconstruction, and residual.
+
+    Real arrays are |chi(R)| (two rows). Complex arrays - a fit to chi(k)
+    data - add a row with Re chi(R), where the phase information lives, and
+    the residual row then shows Re (solid) and Im (dotted).
+    """
     n = data.shape[0]
-    fig, axes = plt.subplots(2, n, figsize=(2.75 * n, 3.9), sharex=True,
-                             gridspec_kw=dict(height_ratios=[2.6, 1.0], hspace=0.08,
+    cplx = np.iscomplexobj(data)
+    titles = _channel_titles(n, labels)
+    nrow = 3 if cplx else 2
+    heights = [2.2, 1.7, 1.0] if cplx else [2.6, 1.0]
+    fig, axes = plt.subplots(nrow, n, figsize=(2.75 * n, 1.55 * sum(heights)),
+                             sharex=True, squeeze=False,
+                             gridspec_kw=dict(height_ratios=heights, hspace=0.08,
                                               wspace=0.28))
     lo, hi = R[mask].min(), R[mask].max()
+    mag = (np.abs(data), np.abs(model), np.abs(ideal))
     for e in range(n):
         ax = axes[0, e]
         ax.axvspan(lo, hi, color=BAND, zorder=0, lw=0)
-        if spread is not None:
+        if spread is not None and not cplx:
             ax.fill_between(R, data[e] - spread[e], data[e] + spread[e],
                             color=C_DATA, alpha=0.13, lw=0, zorder=1)
-        ax.plot(R, data[e], color=C_DATA, lw=1.4, zorder=3, label="measured")
-        ax.plot(R, ideal[e], color=C_IDEAL, lw=1.0, ls=(0, (4, 1.6)), zorder=2,
+        ax.plot(R, mag[0][e], color=C_DATA, lw=1.4, zorder=3, label="measured")
+        ax.plot(R, mag[2][e], color=C_IDEAL, lw=1.0, ls=(0, (4, 1.6)), zorder=2,
                 label=f"ideal FCC (R={r_factor_ideal:.4f})")
-        ax.plot(R, model[e], color=C_FIT, lw=1.3, ls=(0, (1.4, 1.4)), zorder=4,
+        ax.plot(R, mag[1][e], color=C_FIT, lw=1.3, ls=(0, (1.4, 1.4)), zorder=4,
                 label=f"fit (R={r_factor:.4f})")
         if shells is not None:
             for s in shells[:3]:
                 ax.axvline(s, color=INK2, lw=0.6, ls=":", zorder=1)
         ax.set_xlim(0.8, 6.0)
-        ax.set_title(f"{ELEMENTS[e]} edge", fontsize=8.5, pad=4)
+        ax.set_title(titles[e], fontsize=8.5, pad=4)
         ax.grid(zorder=0); ax.set_axisbelow(True)
         if e == 0:
             ax.set_ylabel(r"$|\chi(R)|$   (a.u.)")
             ax.legend(loc="upper right", handlelength=1.9, labelspacing=0.25,
                       borderaxespad=0.3, framealpha=0.9)
-        ax2 = axes[1, e]
+        if cplx:
+            axr = axes[1, e]
+            axr.axvspan(lo, hi, color=BAND, zorder=0, lw=0)
+            axr.axhline(0, color=INK2, lw=0.7)
+            axr.plot(R, data[e].real, color=C_DATA, lw=1.2, zorder=3)
+            axr.plot(R, ideal[e].real, color=C_IDEAL, lw=0.9, ls=(0, (4, 1.6)), zorder=2)
+            axr.plot(R, model[e].real, color=C_FIT, lw=1.2, ls=(0, (1.4, 1.4)), zorder=4)
+            axr.grid(zorder=0); axr.set_axisbelow(True)
+            if e == 0:
+                axr.set_ylabel(r"Re $\chi(R)$")
+        ax2 = axes[-1, e]
         ax2.axvspan(lo, hi, color=BAND, zorder=0, lw=0)
         ax2.axhline(0, color=INK2, lw=0.7)
-        ax2.plot(R, model[e] - data[e], color=C_FIT, lw=1.0)
+        resid = model[e] - data[e]
+        if cplx:
+            ax2.plot(R, resid.real, color=C_FIT, lw=1.0, label="Re")
+            ax2.plot(R, resid.imag, color=C_FIT, lw=0.9, ls=(0, (1.2, 1.2)), label="Im")
+            if e == 0:
+                ax2.legend(loc="upper right", ncol=2, borderaxespad=0.2, fontsize=6.8)
+        else:
+            ax2.plot(R, resid, color=C_FIT, lw=1.0)
         ax2.set_xlabel(r"$R$  (Å)")
         ax2.grid(zorder=0); ax2.set_axisbelow(True)
         if e == 0:
             ax2.set_ylabel("fit − data")
     fig.suptitle(title, fontsize=9.5, y=1.005)
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def k_comparison(path, chik, S, species, scales, title, kweight=None, pos=None,
+                 ideal_species=None, ideal_scales=None):
+    """k-space view of a fit to chi(k) data: k^w chi(k) measured against the
+    reconstruction (and the ideal model), one panel per edge, with the
+    window shaded. The model is drawn on each edge's experimental k axis
+    (its fitted E0 applied), which is the axis the data are on.
+    """
+    w = int(S.kweights[0] if kweight is None else kweight)
+    n = chik.nsp
+    fig, axes = plt.subplots(1, n, figsize=(2.9 * n, 2.6), squeeze=False,
+                             gridspec_kw=dict(wspace=0.28))
+    chi_fit = S.chi_k(species, pos)
+    chi_ideal = None if ideal_species is None else S.chi_k(ideal_species)
+    for e in range(n):
+        ax = axes[0, e]
+        ax.axvspan(S.kmin, S.kmax, color=BAND, zorder=0, lw=0)
+        ax.axhline(0, color=INK2, lw=0.6)
+        k, y = chik.weighted(e, w)
+        ax.plot(k, y, color=C_DATA, lw=1.3, zorder=3, label="measured")
+        ke = S.k_exp(e)
+        if chi_ideal is not None:
+            si = scales if ideal_scales is None else ideal_scales
+            ax.plot(ke, ke ** w * chi_ideal[e] * si[e], color=C_IDEAL, lw=0.9,
+                    ls=(0, (4, 1.6)), zorder=2, label="ideal FCC")
+        ax.plot(ke, ke ** w * chi_fit[e] * scales[e], color=C_FIT, lw=1.2,
+                ls=(0, (1.4, 1.4)), zorder=4, label="fit")
+        ax.set_xlim(max(0.0, S.kmin - 1.5), S.kmax + 1.5)
+        ax.set_xlabel(r"$k$  (Å$^{-1}$)")
+        ax.set_title(f"{ELEMENTS[e]} edge", fontsize=8.5, pad=4)
+        ax.grid(zorder=0); ax.set_axisbelow(True)
+        if e == 0:
+            ax.set_ylabel(rf"$k^{w}\,\chi(k)$")
+            ax.legend(loc="upper right", handlelength=1.9, labelspacing=0.25,
+                      borderaxespad=0.3, framealpha=0.9, fontsize=6.8)
+    fig.suptitle(title, fontsize=9.5, y=1.02)
     fig.savefig(path)
     plt.close(fig)
 
