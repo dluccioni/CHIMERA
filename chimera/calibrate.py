@@ -128,7 +128,8 @@ class Stage1:
 
     def __init__(self, sm, comp, ms=True, free_window=True, free_dr=True,
                  free_c3=True, free_shell_sigma=True, dE0_bounds=(-5.0, 35.0),
-                 window_bounds=((2.5, 4.0), (11.0, 15.0)), with_sigma=True):
+                 window_bounds=((2.5, 4.0), (11.0, 15.0)), with_sigma=True,
+                 free_a0=False, a0_bounds=(3.40, 3.65)):
         self.sm, self.comp = sm, np.asarray(comp, float)
         self.names, self.bounds = [], []
 
@@ -157,6 +158,10 @@ class Stage1:
         if free_window:
             add("kmin", *window_bounds[0])
             add("kmax", *window_bounds[1])
+        # a0 at the reference point, only when there is nothing to anchor it to
+        self.free_a0 = bool(free_a0)
+        if free_a0:
+            add("a0", *a0_bounds)
 
     def unpack(self, x):
         x = np.asarray(x, float)
@@ -176,13 +181,15 @@ class Stage1:
             p["ms_amp"] = float(np.exp(x[i])); p["ms_c"] = float(np.exp(x[i + 1])); i += 2
         if self.window:
             p["kmin"] = float(x[i]); p["kmax"] = float(x[i + 1]); i += 2
+        if self.free_a0:
+            p["a0"] = float(x[i]); i += 1
         return p
 
     def x0(self, like=None, values=None):
         """A starting point: the defaults, overridden by `values` (a dict of
         name -> value) or by another Stage1's solution (`like` = (stage, x))."""
         defaults = dict(log_sigma=np.log(3.0), log_ms_amp=0.0, log_ms_c=np.log(1.3),
-                        kmin=3.0, kmax=13.0)
+                        kmin=3.0, kmax=13.0, a0=A0_AMBIENT)
         vals = {}
         if like is not None:
             other, xo = like
@@ -255,18 +262,28 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
     sm.set_params(kmin=kmin, kmax=kmax, kweight=kweight)
     N0 = sm.random_counts()
     comp = sm.absorber_counts(N0) / sm.natoms
+    # Stage 1 holds a0 at `a0_ambient` while it fits dE0, which is what breaks
+    # the a0/E0 degeneracy - but only if the reference point IS ambient. With
+    # `anchor_a0=False` there is nothing to anchor to (the 2026-09-15 chi(k)
+    # export starts at 3 GPa), and pinning a0 to the ambient literature value
+    # there biases dE0: on that data it left the shared dE0 ~2.5 eV off and
+    # every pressure 0.018 A high in a0, for a 24% worse R-factor. So a0 joins
+    # the stage-1 search instead, which the phase makes identifiable.
     flags = dict(ms=ms, free_window=free_window, free_dr=free_dr, free_c3=free_c3,
-                 free_shell_sigma=free_shell_sigma)
+                 free_shell_sigma=free_shell_sigma, free_a0=not anchor_a0)
     stage = Stage1(sm, comp, **flags)
     core = Stage1(sm, comp, ms=ms, free_window=free_window, free_dr=False,
-                  free_c3=False, free_shell_sigma=False)
-    shared = Stage1(sm, comp, with_sigma=False, **flags)
+                  free_c3=False, free_shell_sigma=False, free_a0=not anchor_a0)
+    # stage 3 refits only the parameters COMMON to every pressure, and a0 is
+    # not one of them - it is held per pressure there and refit by stage 2
+    shared = Stage1(sm, comp, with_sigma=False, **{**flags, "free_a0": False})
     data0 = AV[P0]
     de = dict(seed=seed, tol=1e-8, polish=True)
 
-    # ---- stage 1: everything but a0, at the anchored ambient lattice constant
     def score1(x, kw, st):
-        sm.set_params(a0=a0_ambient, kweight=kw, **st.unpack(x))
+        p = st.unpack(x)
+        p.setdefault("a0", a0_ambient)
+        sm.set_params(kweight=kw, **p)
         return sm.r_factor(N0, data0, mask, idx)
 
     # ---- stage 2: a0 (and the sigma^2 scale) per pressure, everything else
@@ -324,7 +341,8 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
         else:
             r, nfev = rc, int(rc.nfev)
         p1 = stage.unpack(r.x)
-        p1.update(a0=a0_ambient, kweight=kw)
+        p1.setdefault("a0", a0_ambient)
+        p1.update(kweight=kw)
         row = dict(kweight=kweight_value(kw), r_factor_anchor=float(r.fun),
                    r_factor_core=float(rc.fun), n_eval=nfev)
         if verbose:
@@ -340,7 +358,8 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
                                         maxiter=max(de_maxiter // 2, 20), popsize=de_popsize,
                                         x0=shared.x0(like=(stage, r.x)), **de)
             p1 = shared.unpack(r3.x)
-            p1.update(a0=a0_ambient, kweight=kw, sigma_scale=sig_P[P0])
+            p1.setdefault("a0", a0_P[P0])
+            p1.update(kweight=kw, sigma_scale=sig_P[P0])
             out = stage2(p1, dict())
             row["n_eval"] += int(r3.nfev)
         row["r_factor_joint"] = float(np.mean([out[P]["r_factor_ideal"] for P in P_all]))
