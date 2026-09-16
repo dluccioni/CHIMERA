@@ -283,8 +283,57 @@ CALIB_VARIANTS = [
 ]
 
 
+def band_from_variants(rows, tol=1.3):
+    """The Warren-Cowley spread over calibration variants that the data cannot
+    reject, from the rows `systematic_band` produces (or reads back from
+    `_variants_<P>.json`).
+
+    Two things decide which variants count.
+
+    A variant that changes the SET of k weights is not comparable at all: it
+    fits a different number of channels, weighted differently, so its
+    R-factor is on another scale (on the CrCoNi chi(k) data k^4 alone scored
+    half the k^1,2,3 baseline). Those are reported but excluded.
+
+    Among the comparable ones, "cannot reject" is measured against the
+    BASELINE - the fit actually being reported - not against the best variant.
+    Using the best made the band exclude the baseline itself as soon as some
+    variant fitted much better, which happens with chi(k) data: the phase
+    determines E0 well enough that the +-2 eV probe, sized for magnitude-only
+    data, is now a several-sigma perturbation and moves the R-factor by tens
+    of percent. A variant that fits BETTER than the baseline is always kept -
+    the data does not reject it, and its presence is itself a signal that the
+    calibration is not at its optimum.
+    """
+    W = np.array([r["wc"] for r in rows])
+    rf = np.array([r["r_factor_common"] if r.get("r_factor_common") is not None
+                   else r["r_factor"] for r in rows])
+    nch = np.array([r.get("n_channels", 0) for r in rows])
+    comparable = nch == nch[0]                    # baseline is rows[0]
+    keep = comparable & (rf <= tol * rf[0])
+    keep[0] = True                                # the reported fit is always in
+    Wk = W[keep]
+    better = [r["variant"] for r, k, c in zip(rows, rf < rf[0], comparable)
+              if k and c]
+    return dict(wc_mean=W[comparable].mean(0).tolist(),
+                wc_sd=W[comparable].std(0).tolist(),
+                wc_min=Wk.min(0).tolist(), wc_max=Wk.max(0).tolist(),
+                wc_min_all=W[comparable].min(0).tolist(),
+                wc_max_all=W[comparable].max(0).tolist(),
+                n_admissible=int(keep.sum()), n_variants=int(len(rows)),
+                n_comparable=int(comparable.sum()),
+                admissible=[r["variant"] for r, k in zip(rows, keep) if k],
+                excluded_incomparable=[r["variant"] for r, c in zip(rows, comparable)
+                                       if not c],
+                fit_better_than_baseline=better,
+                r_factor_baseline=float(rf[0]),
+                r_factor_range=[float(rf[comparable].min()),
+                                float(rf[comparable].max())])
+
+
 def systematic_band(R_data, data, cal, seeds=(0,), nsteps=6000, nrep=48,
-                    variants=CALIB_VARIANTS, verbose=False, swap_frac=1.0):
+                    variants=CALIB_VARIANTS, verbose=False, swap_frac=1.0,
+                    tol=1.3):
     """Refit under each calibration variant; the spread IS the systematic error.
 
     Every variant is a choice the data cannot distinguish - they all fit to
@@ -323,27 +372,15 @@ def systematic_band(R_data, data, cal, seeds=(0,), nsteps=6000, nrep=48,
                       eval_mask=common, crlb=False)
         rows.append(dict(variant=name, wc=res["wc"], r_factor=res["r_factor"],
                          r_factor_common=res["r_factor_common"],
-                         a0=res["a0"], sigma2_nn=res["sigma2_nn"]))
+                         a0=res["a0"], sigma2_nn=res["sigma2_nn"],
+                         n_channels=len(res["channels"]),
+                         kweights=list(res["kweights"])))
         if verbose:
             print(f"    {name:16s} R={res['r_factor']:.4f} "
                   f"(common {res['r_factor_common']:.4f})  "
                   f"WC={np.round(res['wc'], 3)}")
         del S
-    W = np.array([r["wc"] for r in rows])
-    rf = np.array([r["r_factor_common"] if r["r_factor_common"] is not None
-                   else r["r_factor"] for r in rows])
-    # A variant only counts as an alternative the data cannot reject if it
-    # fits comparably well ON THE COMMON RANGE - scoring each variant over its
-    # own window would automatically favour the narrow ones.
-    keep = rf <= 1.3 * rf.min()
-    Wk = W[keep]
-    return dict(variants=rows,
-                wc_mean=W.mean(0).tolist(), wc_sd=W.std(0).tolist(),
-                wc_min=Wk.min(0).tolist(), wc_max=Wk.max(0).tolist(),
-                wc_min_all=W.min(0).tolist(), wc_max_all=W.max(0).tolist(),
-                n_admissible=int(keep.sum()), n_variants=int(len(rows)),
-                admissible=[r["variant"] for r, k in zip(rows, keep) if k],
-                r_factor_range=[float(rf.min()), float(rf.max())])
+    return dict(variants=rows, **band_from_variants(rows, tol=tol))
 
 
 # ------------------------------------------------------------------ structure

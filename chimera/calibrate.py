@@ -359,6 +359,9 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
                                 shell_sigma=free_shell_sigma),
                       target_complex=bool(chik), a0_anchored=bool(anchor_a0))
     shared_rec["kweight"] = kweight_value(shared_rec["kweight"])
+    # the window is only in `names` when it was searched; record it either way
+    shared_rec.setdefault("kmin", out[P0]["kmin"])
+    shared_rec.setdefault("kmax", out[P0]["kmax"])
     shared_rec["dE0"] = np.asarray(shared_rec["dE0"]).tolist()
     for k in ("sigma_shell_scale", "dr", "c3"):
         if k in shared_rec:
@@ -479,24 +482,44 @@ def calibrate_legacy(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEI
 
 
 def equation_of_state(cal):
-    """V/V0 and a secant bulk modulus from the fitted lattice constants."""
+    """V/V0 and bulk moduli from the fitted lattice constants.
+
+    `B0_BM2_GPa` is a 2nd-order Birch-Murnaghan fit, which presumes V0 is the
+    AMBIENT volume: the form P(V) = 1.5 B0 (x^7 - x^5) has P = 0 at V = V0. It
+    is therefore only reported when the series actually contains 0 GPa. Fitting
+    it to a series that starts at 3 GPa - pretending the 3 GPa volume is the
+    zero-pressure one - inflated B0 from ~250 to 338 GPa on the 2026-09-15
+    chi(k) run, which is an artefact of the missing anchor, not stiffness.
+
+    `B_secant_GPa` needs no such assumption: between any two points it is
+    dP / (dV/V), reported for every consecutive pair and, when ambient is
+    present, from ambient to each point.
+    """
     Ps = sorted(cal)
     P = np.array(Ps, float)
     a = np.array([cal[p]["a0"] for p in Ps])
     V = a ** 3
-    out = dict(pressure=P.tolist(), a0=a.tolist(), V_over_V0=(V / V[0]).tolist())
-    hi = P > 0
-    out["B_secant_GPa"] = [float(p / max(1 - v, 1e-9))
-                           for p, v in zip(P[hi], (V / V[0])[hi])]
-    if len(Ps) < 2:
-        return out
-    # Birch-Murnaghan 2nd order fit (B0' = 4)
-    def bm(B0):
-        x = (V[0] / V) ** (1 / 3)
-        return np.sum((1.5 * B0 * (x ** 7 - x ** 5) * (1 + 0.75 * (4 - 4) * (x ** 2 - 1)) - P) ** 2)
-    from scipy.optimize import minimize_scalar
-    r = minimize_scalar(bm, bounds=(50, 500), method="bounded")
-    out["B0_BM2_GPa"] = float(r.x)
+    out = dict(pressure=P.tolist(), a0=a.tolist(), V_over_V0=(V / V[0]).tolist(),
+               V0_reference_GPa=float(P[0]))
+    if P[0] == 0:
+        hi = P > 0
+        out["B_secant_GPa"] = [float(p / max(1 - v, 1e-9))
+                               for p, v in zip(P[hi], (V / V[0])[hi])]
+    else:
+        out["B_secant_GPa"] = None
+    out["B_secant_pairs_GPa"] = [
+        dict(P_lo=float(P[i]), P_hi=float(P[i + 1]),
+             B=float((P[i + 1] - P[i]) / max(1 - V[i + 1] / V[i], 1e-9)))
+        for i in range(len(P) - 1)]
+    out["B0_BM2_GPa"] = None
+    if len(Ps) >= 2 and P[0] == 0:
+        # Birch-Murnaghan 2nd order fit (B0' = 4)
+        def bm(B0):
+            x = (V[0] / V) ** (1 / 3)
+            return np.sum((1.5 * B0 * (x ** 7 - x ** 5) - P) ** 2)
+        from scipy.optimize import minimize_scalar
+        out["B0_BM2_GPa"] = float(minimize_scalar(bm, bounds=(50, 500),
+                                                  method="bounded").x)
     return out
 
 
