@@ -220,18 +220,20 @@ class Spectrum:
         or several; every (edge, k weight) pair becomes one transform, and
         `chan_edge` records the edge of each."""
         if kmin is not None:
-            self.kmin = float(kmin)
+            self.kmin = float(kmin) if np.isscalar(kmin) else np.asarray(kmin, float)
         if kmax is not None:
-            self.kmax = float(kmax)
+            self.kmax = float(kmax) if np.isscalar(kmax) else np.asarray(kmax, float)
         if kweight is not None:
             self.kweights = as_kweights(kweight)
         if dE0 is not None:
             self.dE0 = np.atleast_1d(np.asarray(dE0, float)) * np.ones(NSP)
         self.ft = []
+        lo = np.atleast_1d(self.kmin); hi = np.atleast_1d(self.kmax)
         for e in range(NSP):
             k_exp = self.k_exp(e)
             for w in self.kweights:
-                self.ft.append(FourierTransform(k_exp, self.kmin, self.kmax, w,
+                self.ft.append(FourierTransform(k_exp, float(lo[e % lo.size]),
+                                                float(hi[e % hi.size]), w,
                                                 dk_win=self.dk_win, xp=cp))
         self.chan_edge = channel_edges(NSP, len(self.kweights))
         self.nchan = len(self.ft)

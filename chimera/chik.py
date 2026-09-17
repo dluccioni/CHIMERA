@@ -95,15 +95,34 @@ def make_window(obj):
         return obj
     if hasattr(obj, "window"):
         return obj.window
-    kmin, kmax, kws = obj[:3]
+    kmin, kmax, kws = obj[0], obj[1], obj[2]
     dk_win = obj[3] if len(obj) > 3 else 1.0
-    return Window(float(kmin), float(kmax), as_kweights(kws), float(dk_win))
+    # kmin/kmax stay as given: a scalar, or one value per edge
+    conv = (lambda v: float(v)) if np.isscalar(v0 := kmin) else (lambda v: np.asarray(v, float))
+    return Window(conv(kmin), conv(kmax), as_kweights(kws), float(dk_win))
+
+
+def window_for_edge(window, e):
+    """The scalar Window edge `e` is transformed with.
+
+    `kmin`/`kmax` may be one number for every edge, or one PER EDGE. Per-edge
+    limits matter when the edges were measured over different energy ranges:
+    a single window has to fit inside the narrowest of them, which throws away
+    whatever the others measured beyond it. Here Co stops at 11.3 A^-1 while Cr
+    reaches 13.65 and Ni 13.15, so a common window costs those two about a
+    quarter of their range - and the transform is per-edge already.
+    """
+    w = make_window(window)
+    lo = np.atleast_1d(w.kmin); hi = np.atleast_1d(w.kmax)
+    return Window(float(lo[e % lo.size]), float(hi[e % hi.size]),
+                  as_kweights(w.kweights), float(w.dk_win))
 
 
 def _key(window):
     w = make_window(window)
-    return (round(w.kmin, 6), round(w.kmax, 6), as_kweights(w.kweights),
-            round(w.dk_win, 6))
+    return (tuple(np.round(np.atleast_1d(w.kmin), 6)),
+            tuple(np.round(np.atleast_1d(w.kmax), 6)),
+            as_kweights(w.kweights), round(float(w.dk_win), 6))
 
 
 # ------------------------------------------------------------------ transform
@@ -118,7 +137,9 @@ def transforms(k, window):
     if key not in _FT_CACHE:
         if len(_FT_CACHE) > 64:
             _FT_CACHE.clear()
-        _FT_CACHE[key] = [FourierTransform(k, w.kmin, w.kmax, kw, dk_win=w.dk_win, xp=np)
+        _FT_CACHE[key] = [FourierTransform(k, float(np.atleast_1d(w.kmin)[0]),
+                                           float(np.atleast_1d(w.kmax)[0]),
+                                           kw, dk_win=w.dk_win, xp=np)
                           for kw in w.kweights]
     return _FT_CACHE[key]
 
@@ -176,7 +197,8 @@ class ChiK:
         if key not in self._cache:
             if len(self._cache) > 32:
                 self._cache.clear()
-            rows = [transform(self.k[e], self.chi[e], window) for e in range(self.nsp)]
+            rows = [transform(self.k[e], self.chi[e], window_for_edge(window, e))
+                    for e in range(self.nsp)]
             self._cache[key] = np.ascontiguousarray(np.concatenate(rows, axis=0))
         return self._cache[key]
 
@@ -193,10 +215,13 @@ class ChiK:
         return np.sqrt(0.5 * np.mean(np.abs(tail) ** 2, axis=1))
 
     def n_independent(self, window, rmin, rmax):
-        """Stern's count per edge, 2 dk dR / pi + 2: with the phase kept, all
-        of it is available to the fit."""
-        w = make_window(window)
-        return 2 * (w.kmax - w.kmin) * (rmax - rmin) / np.pi + 2
+        """Stern's count summed over edges, 2 dk dR / pi + 2 each: with the
+        phase kept, all of it is available to the fit."""
+        tot = 0.0
+        for e in range(self.nsp):
+            w = window_for_edge(window, e)
+            tot += 2 * (w.kmax - w.kmin) * (rmax - rmin) / np.pi + 2
+        return tot
 
     def weighted(self, e, kweight):
         """(k, k^w chi) of edge e, for plotting against the model."""

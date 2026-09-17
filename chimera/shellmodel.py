@@ -38,7 +38,11 @@ from .model import k_exp_axis, fit_scales, edge_scales, r_factor, target as _tar
 from .chik import Window, as_kweights, kweight_value, channel_edges
 
 PARAM_NAMES = ("a0", "dE0", "kmin", "kmax", "kweight", "sigma_scale",
-               "sigma_shell_scale", "dr", "c3", "ms_amp", "ms_c")
+               "sigma_shell_scale", "dr", "c3", "ms_amp", "ms_c",
+               # extensions beyond the harmonic shell model; all default to a
+               # value that reproduces it exactly, so enabling one is a
+               # strictly nested comparison
+               "c4", "sigma_pair", "ms_amp_edge")
 
 
 def dr_from_free(x_free, comp):
@@ -58,6 +62,27 @@ def dr_from_free(x_free, comp):
     dr = np.zeros((nsp, nsp))
     dr[iu] = x
     return dr + dr.T - np.diag(np.diag(dr))
+
+
+def pair_log_from_free(x_free, comp, nsp=None):
+    """Symmetric positive (nsp, nsp) multipliers with composition-weighted
+    geometric mean 1, from the free (a <= b) entries.
+
+    The same device `dr_from_free` uses for bond offsets, in log space so the
+    result cannot go negative: a multiplier on sigma^2 has to stay positive,
+    and fixing the mean keeps it from duplicating the global sigma^2 scale.
+    """
+    comp = np.asarray(comp, float)
+    nsp = nsp or comp.size
+    iu = np.triu_indices(nsp)
+    w = np.array([comp[a] * comp[b] * (1.0 if a == b else 2.0) for a, b in zip(*iu)])
+    u = np.zeros(w.size)
+    u[:-1] = np.asarray(x_free, float)
+    u[-1] = -(w[:-1] @ u[:-1]) / w[-1]
+    U = np.zeros((nsp, nsp))
+    U[iu] = u
+    U = U + U.T - np.diag(np.diag(U))
+    return np.exp(U)
 
 
 def sro_directions(nsp):
@@ -104,7 +129,10 @@ class ShellModel:
                       kweight=(3,), sigma_scale=1.0,
                       sigma_shell_scale=np.ones(self.nshell),
                       dr=np.zeros((self.nsp, self.nsp)), c3=np.zeros(self.nshell),
-                      ms_amp=1.0, ms_c=1.3)
+                      ms_amp=1.0, ms_c=1.3,
+                      c4=np.zeros(self.nshell),
+                      sigma_pair=np.ones((self.nsp, self.nsp)),
+                      ms_amp_edge=np.ones(self.nsp))
         self._B = self._ms = self._ft = None
         self._B_key = self._ms_key = self._ft_key = None
 
@@ -137,6 +165,8 @@ class ShellModel:
                     kweight=kweight_value(p["kweight"]), sigma_scale=p["sigma_scale"],
                     sigma_shell_scale=p["sigma_shell_scale"].tolist(),
                     dr=p["dr"].tolist(), c3=p["c3"].tolist(),
+                    c4=p["c4"].tolist(), sigma_pair=p["sigma_pair"].tolist(),
+                    ms_amp_edge=p["ms_amp_edge"].tolist(),
                     ms_amp=p["ms_amp"], ms_c=p["ms_c"],
                     multiple_scattering=self.ms_paths is not None)
 
@@ -153,12 +183,18 @@ class ShellModel:
                 assert v.size == self.nshell, f"need {self.nshell} per-shell factors"
             elif key == "dr":
                 v = np.asarray(v, float).reshape(self.nsp, self.nsp)
-            elif key == "c3":
+            elif key in ("c3", "c4"):
                 c = np.atleast_1d(np.asarray(v, float))
                 v = np.zeros(self.nshell)
                 v[:min(c.size, self.nshell)] = c[:self.nshell]
+            elif key == "sigma_pair":
+                v = np.asarray(v, float).reshape(self.nsp, self.nsp)
+            elif key == "ms_amp_edge":
+                v = np.asarray(v, float).ravel() * np.ones(self.nsp)
             elif key == "kweight":
                 v = as_kweights(v)
+            elif key in ("kmin", "kmax"):
+                v = float(v) if np.isscalar(v) else np.asarray(v, float)
             else:
                 v = float(v)
             self.p[key] = v
@@ -186,20 +222,42 @@ class ShellModel:
 
     # -------------------------------------------------------------- pieces
     def basis(self):
+        """B[a, b, s](k), the chi(k) one (absorber a, scatterer b, shell s) pair
+        contributes.
+
+        Beyond the harmonic shell model this carries, when they are set:
+
+          sigma_pair  a per-PAIR-TYPE multiplier on sigma^2 in the first shell.
+                      The model already gives each pair type its own bond
+                      LENGTH (`dr`); in an alloy with this much size mismatch
+                      the widths differ too, and forcing one width on all six
+                      pair types makes the first shell too narrow and spills
+                      amplitude into its flanks.
+          c4          the fourth cumulant, entering the amplitude as
+                      exp(+2/3 k^4 C4). Without it C3 is the only route to a
+                      non-Gaussian pair distribution and gets over-driven.
+        """
         p = self.p
         key = (p["a0"], p["sigma_scale"], p["sigma_shell_scale"].tobytes(),
-               p["dr"].tobytes(), p["c3"].tobytes())
+               p["dr"].tobytes(), p["c3"].tobytes(), p["c4"].tobytes(),
+               p["sigma_pair"].tobytes())
         if self._B_key != key:
             k = self.k
             r_s, s2 = self.radii(), self.sigma2_shell()
             B = np.zeros((self.nsp, self.nsp, self.nshell, k.size))
+            k2, k3, k4 = k ** 2, k ** 3, k ** 4
             for s in range(self.nshell):
-                ph3 = (4.0 / 3.0) * k ** 3 * p["c3"][s]
+                ph3 = (4.0 / 3.0) * k3 * p["c3"][s]
+                amp4 = (2.0 / 3.0) * k4 * p["c4"][s]
                 for a in range(self.nsp):
                     for b in range(self.nsp):
                         r = r_s[s] + (p["dr"][a, b] if s == 0 else 0.0)
+                        # the pair-type width applies where the pair types are
+                        # resolved at all, which is the first shell
+                        s2ab = s2[s] * (p["sigma_pair"][a, b] if s == 0 else 1.0)
                         B[a, b, s] = (self.s02 * self.f[b] / (k * r * r)
-                                      * np.exp(-2.0 * r / self.lam - 2.0 * k ** 2 * s2[s])
+                                      * np.exp(-2.0 * r / self.lam
+                                               - 2.0 * k2 * s2ab + amp4)
                                       * np.sin(2.0 * k * r + self.delta[a, b] - ph3))
             self._B, self._B_key = B, key
         return self._B
@@ -210,21 +268,30 @@ class ShellModel:
         p = self.p
         r_nn = float(self.radii()[0])
         s2nn = float(self.sigma2_shell()[0])
-        key = (r_nn, s2nn, p["ms_amp"], p["ms_c"])
+        key = (r_nn, s2nn, p["ms_amp"], p["ms_c"], p["ms_amp_edge"].tobytes())
         if self._ms_key != key:
-            self._ms = self.ms_paths.chi_fast(
+            ms = self.ms_paths.chi_fast(
                 sigma2_nn=s2nn, r_nn=r_nn, c_ms=p["ms_c"], amp=p["ms_amp"],
                 s02=self.s02, a_scale=r_nn / multiscat.D_NN_FEFF)
+            # one amplitude per ABSORBER on top of the global one: the frozen
+            # composition-averaged MS term cannot know which species lie along
+            # each path, and a global amplitude fitted above 1 is that mismatch
+            # showing up somewhere it does not belong
+            self._ms = ms * p["ms_amp_edge"][:, None]
             self._ms_key = key
         return self._ms
 
     def fts(self):
         """One transform per channel: (edge, k weight) pairs, edge-major."""
         p = self.p
-        key = (p["dE0"].tobytes(), p["kmin"], p["kmax"], p["kweight"])
+        key = (p["dE0"].tobytes(), tuple(np.atleast_1d(p["kmin"])),
+               tuple(np.atleast_1d(p["kmax"])), p["kweight"])
         if self._ft_key != key:
-            self._ft = [FourierTransform(k_exp_axis(self.k, p["dE0"][e]), p["kmin"],
-                                         p["kmax"], w, dk_win=self.dk_win, xp=np)
+            lo = np.atleast_1d(p["kmin"]); hi = np.atleast_1d(p["kmax"])
+            self._ft = [FourierTransform(k_exp_axis(self.k, p["dE0"][e]),
+                                         float(lo[e % lo.size]),
+                                         float(hi[e % hi.size]),
+                                         w, dk_win=self.dk_win, xp=np)
                         for e in range(self.nsp) for w in p["kweight"]]
             self._ft_key = key
         return self._ft

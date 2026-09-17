@@ -129,7 +129,8 @@ class Stage1:
     def __init__(self, sm, comp, ms=True, free_window=True, free_dr=True,
                  free_c3=True, free_shell_sigma=True, dE0_bounds=(-5.0, 35.0),
                  window_bounds=((2.5, 4.0), (11.0, 15.0)), with_sigma=True,
-                 free_a0=False, a0_bounds=(3.40, 3.65)):
+                 free_a0=False, a0_bounds=(3.40, 3.65),
+                 free_c4=False, free_sigma_pair=False, free_ms_edge=False):
         self.sm, self.comp = sm, np.asarray(comp, float)
         self.names, self.bounds = [], []
 
@@ -150,10 +151,23 @@ class Stage1:
         self.c3 = bool(free_c3)
         if free_c3:
             add("c3", -6e-4, 6e-4)
+        # fourth cumulant: lets the first-shell pair distribution be
+        # non-Gaussian without over-driving C3
+        self.c4 = bool(free_c4)
+        if free_c4:
+            add("c4", -3e-5, 3e-5)
+        # per-pair-type width in the first shell, log scale, mean fixed
+        self.nsp_pair = (len(DR_LABELS) - 1) if free_sigma_pair else 0
+        for lab in DR_LABELS[:self.nsp_pair]:
+            add(f"logs2_{lab}", -0.7, 0.7)
         self.ms = bool(ms)
         if ms:
             add("log_ms_amp", np.log(0.3), np.log(2.5))
             add("log_ms_c", np.log(0.4), np.log(3.0))
+        # one MS amplitude per absorber on top of the global one
+        self.ms_edge = bool(ms and free_ms_edge)
+        for e in range(NSP - 1) if self.ms_edge else ():
+            add(f"log_ms_{ELEMENTS[e]}", -0.5, 0.5)
         self.window = bool(free_window)
         if free_window:
             add("kmin", *window_bounds[0])
@@ -177,8 +191,18 @@ class Stage1:
             p["dr"] = dr_from_free(x[i:i + self.ndr], self.comp); i += self.ndr
         if self.c3:
             p["c3"] = [float(x[i])]; i += 1
+        if self.c4:
+            p["c4"] = [float(x[i])]; i += 1
+        if self.nsp_pair:
+            p["sigma_pair"] = SM.pair_log_from_free(x[i:i + self.nsp_pair], self.comp)
+            i += self.nsp_pair
         if self.ms:
             p["ms_amp"] = float(np.exp(x[i])); p["ms_c"] = float(np.exp(x[i + 1])); i += 2
+        if self.ms_edge:
+            u = np.zeros(NSP)
+            u[:NSP - 1] = x[i:i + NSP - 1]
+            u[-1] = -u[:-1].sum()          # geometric mean 1, so ms_amp keeps it
+            p["ms_amp_edge"] = np.exp(u); i += NSP - 1
         if self.window:
             p["kmin"] = float(x[i]); p["kmax"] = float(x[i + 1]); i += 2
         if self.free_a0:
@@ -226,7 +250,8 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
               verbose=True, kweights=None, free_window=True, free_dr=True,
               free_c3=True, free_shell_sigma=True, free_dE0_per_pressure=False,
               joint=True, de_maxiter=120, de_popsize=12, seed=0, pressures=None,
-              anchor_a0=True):
+              anchor_a0=True, free_c4=False, free_sigma_pair=False,
+              free_ms_edge=False):
     """Global calibration in pair-count space. Returns ({P: dict}, S).
 
     See the module docstring for what is fitted where. `S` is returned set to
@@ -270,7 +295,9 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
     # every pressure 0.018 A high in a0, for a 24% worse R-factor. So a0 joins
     # the stage-1 search instead, which the phase makes identifiable.
     flags = dict(ms=ms, free_window=free_window, free_dr=free_dr, free_c3=free_c3,
-                 free_shell_sigma=free_shell_sigma, free_a0=not anchor_a0)
+                 free_shell_sigma=free_shell_sigma, free_a0=not anchor_a0,
+                 free_c4=free_c4, free_sigma_pair=free_sigma_pair,
+                 free_ms_edge=free_ms_edge)
     stage = Stage1(sm, comp, **flags)
     core = Stage1(sm, comp, ms=ms, free_window=free_window, free_dr=False,
                   free_c3=False, free_shell_sigma=False, free_a0=not anchor_a0)
@@ -382,7 +409,7 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
     shared_rec.setdefault("kmin", out[P0]["kmin"])
     shared_rec.setdefault("kmax", out[P0]["kmax"])
     shared_rec["dE0"] = np.asarray(shared_rec["dE0"]).tolist()
-    for k in ("sigma_shell_scale", "dr", "c3"):
+    for k in ("sigma_shell_scale", "dr", "c3", "c4", "sigma_pair", "ms_amp_edge"):
         if k in shared_rec:
             shared_rec[k] = np.asarray(shared_rec[k]).tolist()
     for P in P_all:
