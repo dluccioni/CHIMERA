@@ -251,7 +251,7 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
               free_c3=True, free_shell_sigma=True, free_dE0_per_pressure=False,
               joint=True, de_maxiter=120, de_popsize=12, seed=0, pressures=None,
               anchor_a0=True, free_c4=False, free_sigma_pair=False,
-              free_ms_edge=False):
+              free_ms_edge=False, x0_values=None):
     """Global calibration in pair-count space. Returns ({P: dict}, S).
 
     See the module docstring for what is fitted where. `S` is returned set to
@@ -361,9 +361,16 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
                                     maxiter=de_maxiter, popsize=de_popsize,
                                     x0=core.x0(), **de)
         if stage.names != core.names:
+            # Seed from the core solution, and from `x0_values` on top of it
+            # where given. Seeding a LARGER model with a smaller one's answer
+            # is what makes a nested comparison monotone: the extended model
+            # starts where the simpler one finished, so it cannot end up
+            # worse unless the search wanders, and a bigger parameter space
+            # is exactly where a fixed budget starts to wander.
             r = differential_evolution(score1, stage.bounds, args=(kw, stage),
                                        maxiter=de_maxiter, popsize=de_popsize,
-                                       x0=stage.x0(like=(core, rc.x)), **de)
+                                       x0=stage.x0(like=(core, rc.x),
+                                                   values=x0_values), **de)
             nfev = int(rc.nfev + r.nfev)
         else:
             r, nfev = rc, int(rc.nfev)
@@ -398,13 +405,16 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
                   f"ms_c={p1.get('ms_c', 0):.2f}  sigma_shell={np.round(p1.get('sigma_shell_scale', np.ones(sm.nshell)), 2)}"
                   f"  [{time.time() - t0:.0f}s]", flush=True)
         if best is None or row["r_factor_joint"] < best[0]:
-            best = (row["r_factor_joint"], kw, dict(p1), out)
-    _, kw_best, p_best, out = best
+            best = (row["r_factor_joint"], kw, dict(p1), out, r.x)
+    _, kw_best, p_best, out, best_x1 = best
     shared_rec = dict(p_best, kweight_scan=scan, joint=bool(joint and len(P_all) > 1),
                       free=dict(window=free_window, dr=free_dr, c3=free_c3,
                                 shell_sigma=free_shell_sigma),
                       target_complex=bool(chik), a0_anchored=bool(anchor_a0))
     shared_rec["kweight"] = kweight_value(shared_rec["kweight"])
+    # the raw stage-1 solution by parameter name, so a later call can start
+    # from it (see `x0_values`)
+    shared_rec["stage1_x"] = {n: float(v) for n, v in zip(stage.names, best_x1)}
     # the window is only in `names` when it was searched; record it either way
     shared_rec.setdefault("kmin", out[P0]["kmin"])
     shared_rec.setdefault("kmax", out[P0]["kmax"])
