@@ -13,7 +13,12 @@ spectra:
             not the physical one: k_exp^2 = k_phys^2 - ETOK * dE0. The model
             is computed on k_phys and transformed against k_exp, which is
             what happened to the data. One value per EDGE, because each edge
-            had its E0 chosen separately.
+            had its E0 chosen separately. k_phys is the internal momentum,
+            so with this constant gap dE0 also carries the inner potential,
+            which really falls by ~9 eV over the fit range (the self-energy);
+            the system's k_axis "table" maps through the scattering
+            calculation's own k(p) instead and leaves dE0 the E0 offset
+            alone (`k_exp_axis`).
     a0      lattice constant. Sets every path length, so it moves all the
             peaks together; strongly determined by the first shell.
     scale   one amplitude factor per edge, absorbing S0^2 and the edge-step
@@ -105,16 +110,43 @@ def scattering_provenance(system):
     """Where a fit's scattering came from, for calibration and summary records:
     the table-set names, and for in-process native paths the engine version,
     recipe, reference spacing and muffin-tin summary."""
-    out = dict(tables=system.tables_name, ms=system.ms_name)
+    out = dict(tables=system.tables_name, ms=system.ms_name, k_axis=system.k_axis)
     name = next((n for n in (system.tables_name, system.ms_name) if is_native(n)), None)
     if name is not None:
         out["native"] = native_paths(system, name).provenance()
     return out
 
 
-def k_exp_axis(k_phys, dE0):
-    """The k axis the experimenter used, given their E0 error."""
-    return np.sqrt(np.maximum(np.asarray(k_phys) ** 2 - ETOK * dE0, 1e-4))
+def k_exp_axis(k_phys, dE0, k_table=None):
+    """The k axis the experimenter used, given their E0 error.
+
+    Without `k_table` the gap between the data's k and the internal momentum
+    is one constant, dE0 (the system's k_axis "constant"). With it -
+    `ScatteringTables.k_of_p` for this edge on the same grid - the
+    calculation's own energy-dependent k(p) is used and dE0 is only the
+    offset between the experimenter's E0 and the calculation's Fermi level
+    (k_axis "table")."""
+    k0 = np.asarray(k_phys) if k_table is None else np.asarray(k_table)
+    return np.sqrt(np.maximum(k0 ** 2 - ETOK * dE0, 1e-4))
+
+
+def k_table_for(system, tables, k_grid):
+    """Per-edge k(p) on `k_grid` when the system maps k through the tables
+    (k_axis "table"), else None. Tables tabulated on p alone (the analytic
+    stand-in) have no Fermi-level reference: k = p."""
+    if getattr(system, "k_axis", "constant") != "table":
+        return None
+    kp = getattr(tables, "k_of_p", None)
+    if kp is None:
+        return np.tile(np.asarray(k_grid, float), (tables.nsp, 1))
+    return np.array([np.interp(k_grid, tables.k, row) for row in kp])
+
+
+def dE0_centre(system):
+    """Where a calibration starts its per-edge dE0 search: with the constant
+    gap dE0 carries the whole inner potential (~12 eV for these tables);
+    through the table only the E0 offset, around zero."""
+    return 0.0 if getattr(system, "k_axis", "constant") == "table" else 12.0
 
 
 class Spectrum:
@@ -195,6 +227,7 @@ class Spectrum:
                                         composition=self.system.composition)
         assert self.tables.nsp == self.nsp, (
             f"tables hold {self.tables.nsp} species, the system {self.nsp}")
+        self._k_table = k_table_for(self.system, self.tables, self.k_phys)
         self.fm = ForwardModel(self.cell, self.tables, self.i, self.j,
                                self.shift0, sigma2=self.sigma2_ref,
                                shell=self.shell_idx)
@@ -317,7 +350,8 @@ class Spectrum:
 
     def k_exp(self, e):
         """The experimental k axis of edge e (its E0 error applied)."""
-        return k_exp_axis(self.k_phys, self.dE0[e])
+        return k_exp_axis(self.k_phys, self.dE0[e],
+                          None if self._k_table is None else self._k_table[e])
 
     def channel_labels(self):
         return channel_labels(self.elements, self.kweights)

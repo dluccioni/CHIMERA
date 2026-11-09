@@ -305,7 +305,14 @@ refuses to drop commits that exist only on `main`).
 * Tables are on the **internal momentum**, not k relative to E0.
   `ScatteringTables.e0_offset_ev` records where k = 0 sits relative to the
   Fermi level (10.3 eV for the CrCoNi tables above); expect a fitted E0 shift
-  of about that size against data referenced to the edge.
+  of about that size against data referenced to the edge. That gap is not a
+  constant: with the self-energy it falls from ~15 to ~6 eV (native) or
+  ~11 to ~1 eV (FEFF8L) over k = 3-13. `--k-axis table` (the system's
+  `k_axis`) maps the data's k through the tables' own `k_of_p`, so the
+  fitted dE0 is only the offset between the experimenter's E0 and the
+  calculation's Fermi level; the default `constant` keeps one gap per edge,
+  as every fit before 2026-11-09 did. The mode is written into every
+  calibration and fit record and restored on reload.
 * Warren-Cowley sign: **positive = like atoms avoid, negative = like atoms
   cluster**. Checked on constructed configurations — a segregated cell gives
   alpha_AA = -1.38, an A-avoiding one +0.43.

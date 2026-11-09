@@ -72,6 +72,11 @@ class ScatteringTables:
                    is measured from the edge, expect a fitted E0 shift of
                    about -e0_offset_ev.
     meta         : provenance and the muffin-tin / interstitial parameters
+    k_of_p       : (NSP, Nk) for each absorber edge, the k measured from the
+                   calculation's Fermi level that goes with each internal
+                   momentum on the grid: p^2 - k^2 is the energy-dependent
+                   inner potential (self-energy included), 15 -> 6 eV over
+                   k = 3-13 for CrCoNi. None for tables tabulated on p alone.
     """
     k: np.ndarray
     f: np.ndarray
@@ -81,6 +86,7 @@ class ScatteringTables:
     red: np.ndarray | None = None
     e0_offset_ev: float = 0.0
     meta: dict = field(default_factory=dict)
+    k_of_p: np.ndarray | None = None
 
     def __post_init__(self):
         n = self.f.shape[0]
@@ -89,6 +95,8 @@ class ScatteringTables:
         assert self.lam.shape == self.k.shape
         if self.red is not None:
             assert self.red.shape == (n, self.k.size), "red must be (nsp, nk)"
+        if self.k_of_p is not None:
+            assert self.k_of_p.shape == (n, self.k.size), "k_of_p must be (nsp, nk)"
 
     @property
     def nsp(self):
@@ -128,12 +136,15 @@ class ScatteringTables:
         comp = comp / comp.sum()
         f_pair = np.zeros((n, n, k.size)); delta = np.zeros((n, n, k.size))
         lam_abs = np.zeros((n, k.size)); e0 = np.zeros(n)
+        k_of_p = np.zeros((n, k.size))
         meta = {}
         for (a, s), d in records.items():
             ia, isc = elements.index(a), elements.index(s)
             f_pair[ia, isc] = np.interp(k, d["p"], d["f"])
             delta[ia, isc] = np.interp(k, d["p"], d["delta"])
             lam_abs[ia] = np.interp(k, d["p"], d["lam"])
+            # one relation per absorber (its potential), the same in each of its records
+            k_of_p[ia] = np.interp(k, d["p"], d["k"])
             e0[ia] = d["e0_offset_ev"]
             meta[(a, s)] = dict(reff=d["reff"], deg=d["deg"], header=d["header"])
         # the kernel carries one amplitude per scatterer: the absorber
@@ -145,7 +156,8 @@ class ScatteringTables:
         return ScatteringTables(k=k, f=f, delta=delta, lam=lam, s02=s02,
                                 red=red, e0_offset_ev=float(comp @ e0),
                                 meta=dict(route=route, pairs=meta, f_pair=f_pair,
-                                          elements=elements, **(extra_meta or {})))
+                                          elements=elements, **(extra_meta or {})),
+                                k_of_p=k_of_p)
 
 
 def columns_to_record(cols, reff, deg=1.0, nleg=2, scatterer=None, header=""):

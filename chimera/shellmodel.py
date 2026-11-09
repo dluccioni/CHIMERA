@@ -33,7 +33,8 @@ import numpy as np
 
 from exafs_gpu.fourier import FourierTransform
 from . import multiscat
-from .model import k_exp_axis, fit_scales, edge_scales, r_factor, target as _target
+from .model import (k_exp_axis, k_table_for, fit_scales, edge_scales, r_factor,
+                    target as _target)
 from .chik import Window, as_kweights, kweight_value, channel_edges
 
 PARAM_NAMES = ("a0", "dE0", "kmin", "kmax", "kweight", "sigma_scale",
@@ -121,6 +122,7 @@ class ShellModel:
         self.composition = tuple(float(x) for x in comp / comp.sum())
         self.elements = tuple(elements) if elements is not None else None
         self.system = system
+        self.k_table = k_table_for(system, tables, self.k)     # None: constant E0 gap
         self.shells_ref = np.asarray(shells_ref, float)
         self.nshell = int(self.shells_ref.size)
         self.z = np.asarray(shell_mult, float)
@@ -298,7 +300,9 @@ class ShellModel:
                tuple(np.atleast_1d(p["kmax"])), p["kweight"])
         if self._ft_key != key:
             lo = np.atleast_1d(p["kmin"]); hi = np.atleast_1d(p["kmax"])
-            self._ft = [FourierTransform(k_exp_axis(self.k, p["dE0"][e]),
+            self._ft = [FourierTransform(k_exp_axis(self.k, p["dE0"][e],
+                                                    None if self.k_table is None
+                                                    else self.k_table[e]),
                                          float(lo[e % lo.size]),
                                          float(hi[e % hi.size]),
                                          w, dk_win=self.dk_win, xp=np)

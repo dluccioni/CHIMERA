@@ -47,6 +47,9 @@ DATA_DIR = os.path.join(_ROOT, "data")
 # conventional lattice constant per nearest-neighbour distance
 A0_PER_NN = {"fcc": np.sqrt(2.0), "bcc": 2.0 / np.sqrt(3.0), "sc": 1.0, "hcp": 1.0}
 
+# how the data's k maps onto the model's momentum (AlloySystem.k_axis)
+K_AXES = ("constant", "table")
+
 
 def tables_dir(name):
     """`data/<name>`, or `name` itself when it is already a directory."""
@@ -94,6 +97,13 @@ class AlloySystem:
     ms_name: str = None
     c_over_a: float = None
     name: str = None
+    # How the data's k (measured from the edge) maps onto the model's internal
+    # momentum p. "constant": p^2 = k^2 + ETOK dE0 with one dE0 per edge, which
+    # then has to carry the whole inner potential (CHIMERA up to 2026-11-09).
+    # "table": through the scattering calculation's own k(p), whose gap falls
+    # from ~15 to ~6 eV over the fit range; dE0 is then only the offset between
+    # the experimenter's E0 and the calculation's Fermi level.
+    k_axis: str = "constant"
 
     def __post_init__(self):
         els = tuple(str(e) for e in self.elements)
@@ -116,6 +126,8 @@ class AlloySystem:
         object.__setattr__(self, "a0_ref", float(self.a0_ref))
         if self.name is None:
             object.__setattr__(self, "name", "".join(els))
+        if self.k_axis not in K_AXES:
+            raise ValueError(f"k_axis must be one of {K_AXES}, not {self.k_axis!r}")
 
     # ----------------------------------------------------------- derived
     @property
@@ -148,7 +160,7 @@ class AlloySystem:
         return dict(elements=list(self.elements), composition=list(self.composition),
                     lattice=self.lattice, a0_ref=self.a0_ref,
                     tables_name=self.tables_name, ms_name=self.ms_name,
-                    c_over_a=self.c_over_a, name=self.name)
+                    c_over_a=self.c_over_a, name=self.name, k_axis=self.k_axis)
 
     @classmethod
     def from_dict(cls, d):
@@ -157,7 +169,8 @@ class AlloySystem:
         return cls(elements=tuple(d["elements"]), composition=d.get("composition"),
                    lattice=d.get("lattice", "fcc"), a0_ref=d.get("a0_ref"),
                    tables_name=d.get("tables_name"), ms_name=d.get("ms_name"),
-                   c_over_a=d.get("c_over_a"), name=d.get("name"))
+                   c_over_a=d.get("c_over_a"), name=d.get("name"),
+                   k_axis=d.get("k_axis", "constant"))
 
     @classmethod
     def from_tables(cls, name, ms_name=None, composition=None, a0_ref=None,

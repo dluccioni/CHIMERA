@@ -136,7 +136,7 @@ class Stage1:
     """Parameter vector <-> ShellModel parameters for the global search."""
 
     def __init__(self, sm, comp, ms=True, free_window=True, free_dr=True,
-                 free_c3=True, free_shell_sigma=True, dE0_bounds=(-5.0, 35.0),
+                 free_c3=True, free_shell_sigma=True, dE0_bounds=None,
                  window_bounds=((2.5, 4.0), (11.0, 15.0)), with_sigma=True,
                  free_a0=False, a0_bounds=None,
                  free_c4=False, free_sigma_pair=False, free_ms_edge=False,
@@ -155,6 +155,12 @@ class Stage1:
         def add(name, lo, hi):
             self.names.append(name); self.bounds.append((float(lo), float(hi)))
 
+        # dE0 carries the whole inner potential when the k gap is taken as
+        # constant (centre 12 eV, the historical -5..35 window), only the E0
+        # offset when k is mapped through the tables (centre 0)
+        self.dE0_start = M.dE0_centre(getattr(sm, "system", None))
+        if dE0_bounds is None:
+            dE0_bounds = (self.dE0_start - 17.0, self.dE0_start + 23.0)
         for e in range(self.nsp):
             add(f"dE0_{els[e]}", *dE0_bounds)
         self.with_sigma = bool(with_sigma)
@@ -243,7 +249,7 @@ class Stage1:
             if n in vals:
                 x.append(float(vals[n]))
             elif n.startswith("dE0"):
-                x.append(12.0)
+                x.append(self.dE0_start)
             else:
                 x.append(defaults.get(n, 0.0))
         return np.array(x)
