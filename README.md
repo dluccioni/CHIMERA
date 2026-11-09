@@ -90,8 +90,30 @@ res["target_complex"], res["kweights"]   # what was fitted
 ```
 
 `chi(k)` arrays from anywhere else go in as `chik.ChiK(k, chi)` (one row per
-edge, in `ELEMENTS` order); `R_data` is then `data.R`, the model's own grid.
+edge, in element order); `R_data` is then `data.R`, the model's own grid.
 `S.set_window(kweight=(1, 2, 3))` fits several k weights at once.
+
+Another alloy is one object away. The elements, composition, lattice,
+reference cell and table names live in an `AlloySystem` (`chimera/system.py`),
+which every class derives its species count from and writes into every
+record:
+
+```python
+from chimera.system import AlloySystem
+sys = AlloySystem.from_tables("feni_bcc2482", ms_name=None, composition=(0.5, 0.5))
+S = M.Spectrum(system=sys)                      # or Spectrum(elements=("Fe", "Ni"),
+                                                #    lattice="bcc", a0_ref=2.87, tables="analytic")
+cal, S = C.calibrate(spectra, R_data, system=sys)
+```
+
+`from_tables` reads the `meta.json` that `feff8l_tables.py` writes (elements,
+composition, lattice, spacing); with nothing given the default is equiatomic
+fcc CrCoNi, exactly as before. `scripts/run_all.py --tables <set>` or
+`--elements .. --lattice .. --a0-ref ..` does the same from the command line,
+and the series points are read off the data folders. The CUDA kernels are
+compiled per species count, the pair-count model, the bounds, the sampler,
+the labels and the figures all follow it; `tests/test_general_system.py`
+runs a binary on bcc, a quaternary on fcc and a binary on hcp end to end.
 
 `F.systematic_band(...)` re-fits under each admissible calibration variant and
 returns the spread — the part of the uncertainty the data cannot resolve.
@@ -114,6 +136,9 @@ chimera/
   model.py         configuration -> chi(k) -> chi(R); cheap calibration updates
   shellmodel.py    the same model in pair-count space (CPU, exact for swap-only
                    fits): calibration objective, Cramer-Rao bounds on alpha
+                   (white, or with a full residual covariance)
+  system.py        the alloy: elements, composition, lattice, reference cell,
+                   table names; the default is equiatomic fcc CrCoNi
   multiscat.py     FEFF8L multiple-scattering paths (3- and 4-leg)
   multift.py       per-edge Fourier transform (each edge has its own E0)
   calibrate.py     global search for E0, k window and weight, a0, sigma^2
@@ -128,23 +153,35 @@ exafs_gpu/
   kernels.py       CUDA source (NVRTC via CuPy)
 methods/
   method_a_rmc.py  parallel-tempering RMC sampler
-feff8l_tables.py   generates data/ for an alloy (needs xraylarch)
+scripts/
+  run_all.py       fit a whole tree; postprocess.py runs the tables, tests,
+                   grading, figures and README on it
+  correlated_bound.py   Cramer-Rao bound with the residual's correlation in R
+                        and between k-weight channels (model-discrepancy view)
+  detectable_sro.py     minimum detectable order by injection-recovery against
+                        the production residual: the experiment's power
+  design_experiment.py  information budget: what each edge, k band, window
+                        extension and auxiliary measurement is worth
+  test_*.py        the analysis record behind testing/MODEL_CHANGES.md
+feff8l_tables.py   generates data/ for an alloy on sc, bcc, fcc or hcp
+                   (needs xraylarch)
 ```
 
 ## Scope and limits
 
 * **Lattice.** `CrystalSupercell` handles `sc`, `bcc`, `fcc` and `hcp`,
-  including the non-orthogonal hcp cell. `Spectrum` currently builds an fcc
-  supercell, and `feff8l_tables.py` builds an fcc cluster; other lattices need
-  those two call sites opened up.
-* **Species count.** The CUDA source takes `NSP` as a compile-time define, so
-  the kernels serve any number of species. The Python side does not yet follow:
-  retargeting to another alloy means editing four values in place —
-  `ELEMENTS` and `Z_OF` in `exafs_gpu/scattering.py`, the reference lattice
-  constant `self.a0_ref` in `model.py`, and `D_NN_FEFF` in `multiscat.py`
-  (the spacing the FEFF paths were computed for). Everything else is already
-  an argument: `Spectrum(a0=, tables_name=, ms_name=)`,
-  `calibrate(a0_ambient=)`, `ShellModel(a0_ref=)`.
+  including the non-orthogonal hcp cell, and `Spectrum`, `feff8l_tables.py`
+  and the CIF export take the lattice from the `AlloySystem`. For hcp the
+  reference `a0_ref` is the in-plane constant `a`.
+* **Species count.** Any number of species: the CUDA source takes `NSP` as a
+  compile-time define, and the Python side reads it from the system. The
+  mean-zero per-edge E0 shift has `nsp - 1` free entries, the bond-offset
+  matrix `nsp(nsp+1)/2 - 1`, and there are `nsp(nsp-1)/2` order directions
+  per shell.
+* **Multiple scattering** needs a FEFF8L path set for the alloy
+  (`feff8l_tables.py --nleg 4 --rpath ..`); without one the model is
+  single-scattering and the fit range should stop before the first
+  collinear shell (`FIT_RMAX_NOMS`).
 * **Site equivalence.** Every basis site must have the same coordination: the
   neighbour-list machinery and the MC proposal kernels assume a uniform
   coordination number.
@@ -190,6 +227,18 @@ feff8l_tables.py   generates data/ for an alloy (needs xraylarch)
   pair counts per shell, `N[absorber, scatterer, shell]`. `shellmodel` uses
   that: the calibration objective and the alpha bounds run on the CPU in
   milliseconds, and agree with the GPU pair sum to 1e-15.
+* **a0 and E0 (settled 2026-10-07).** a0 is free at every series point and
+  the shared per-edge E0 - its common mode included - is fitted in the
+  joint calibration stage together with every point's a0 and sigma^2, with a
+  mean-zero per-edge E0 shift per point on top. The common mode is one
+  number for the whole series, not one per point: the fitted per-point
+  values agreed within 0.13 eV when tried, and one per point lets each
+  point walk its own stretch of the a0/E0 ridge, which shows up as scatter
+  in the equation of state. The cost is that the absolute a0 lands below
+  the diffraction value (about 0.7% on the CrCoNi data) and needs an
+  independent lattice constant before it is quoted; the compression and
+  the bulk modulus are the better-posed numbers. `--no-free-a0` restores
+  the anchored treatment.
 * `dr[a, b]` is the nearest-neighbour bond-length offset of pair type ab
   (Angstrom, symmetric, composition-weighted mean zero so a0 keeps the mean);
   `C3` is the first-shell third cumulant (Angstrom^3), entering the phase as
