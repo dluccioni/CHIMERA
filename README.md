@@ -349,7 +349,11 @@ refuses to drop commits that exist only on `main`).
   the diffraction value (about 0.7% on the CrCoNi data) and needs an
   independent lattice constant before it is quoted; the compression and
   the bulk modulus are the better-posed numbers. `--no-free-a0` restores
-  the anchored treatment.
+  the anchored treatment. The blind synthetic test (2026-11-09) traced the
+  shortfall to the constant E0 gap of the default `--k-axis constant`: on
+  blind_002 it puts a0 1.0-1.1% low with FEFF8L or native tables alike,
+  while `--k-axis table` calibrates a0 to within 0.1% and each edge's E0 to
+  within 0.8 eV (native) or 3.4 eV (FEFF8L), with a 40% lower R-factor.
 * `dr[a, b]` is the nearest-neighbour bond-length offset of pair type ab
   (Angstrom, symmetric, composition-weighted mean zero so a0 keeps the mean);
   `C3` is the first-shell third cumulant (Angstrom^3), entering the phase as
