@@ -353,7 +353,11 @@ refuses to drop commits that exist only on `main`).
   shortfall to the constant E0 gap of the default `--k-axis constant`: on
   blind_002 it puts a0 1.0-1.1% low with FEFF8L or native tables alike,
   while `--k-axis table` calibrates a0 to within 0.1% and each edge's E0 to
-  within 0.8 eV (native) or 3.4 eV (FEFF8L), with a 40% lower R-factor.
+  within 0.8 eV (native) or 3.4 eV (FEFF8L), with a 40% lower R-factor. On
+  the measured CrCoNi series (staged_09162026, FEFF8L tables) the same switch
+  moves the ambient a0 from 3.5346 to 3.5624 A against 3.559-3.567 A by
+  diffraction, lowers the calibration R-factor from 0.015-0.017 to
+  0.008-0.011, and leaves the compression and B0 (214 -> 212 GPa) unchanged.
 * `dr[a, b]` is the nearest-neighbour bond-length offset of pair type ab
   (Angstrom, symmetric, composition-weighted mean zero so a0 keeps the mean);
   `C3` is the first-shell third cumulant (Angstrom^3), entering the phase as
