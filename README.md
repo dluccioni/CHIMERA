@@ -163,9 +163,26 @@ scripts/
   design_experiment.py  information budget: what each edge, k band, window
                         extension and auxiliary measurement is worth
   test_*.py        the analysis record behind testing/MODEL_CHANGES.md
+                   (development branch only)
+tools/
+  promote_to_main.py   builds main from development (see Branches)
 feff8l_tables.py   generates data/ for an alloy on sc, bcc, fcc or hcp
                    (needs xraylarch)
 ```
+
+## Branches
+
+Work is committed to `development`, which holds everything: the library,
+the scripts, `tests/` and the `scripts/test_*.py` investigations. `main` is
+the same history without the paths listed in `tools/devonly_paths.txt`, so
+no commit on `main` contains tests. After committing to `development`, run
+
+```bash
+python tools/promote_to_main.py
+```
+
+to append the new commits to `main` (it never touches the working tree, and
+refuses to drop commits that exist only on `main`).
 
 ## Scope and limits
 

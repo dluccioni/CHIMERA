@@ -1,0 +1,17 @@
+# Paths kept on the development branch only. tools/promote_to_main.py
+# removes them from every commit when it builds main from development.
+# A line ending in "/" is a directory; any other line is a shell-style
+# pattern matched against the whole path.
+tests/
+scripts/test_*.py
+
+# figure scripts that import from the scripts/test_*.py investigations
+scripts/make_error_budget_figure.py
+scripts/make_freshlook_summary.py
+scripts/plot_extra_term.py
+scripts/plot_k_noise.py
+scripts/plot_outlier_positions.py
+scripts/plot_peak_fits.py
+scripts/plot_recommended.py
+scripts/plot_s02_fits.py
+scripts/plot_static_fits.py
