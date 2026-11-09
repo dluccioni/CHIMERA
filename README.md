@@ -62,6 +62,57 @@ multiple-scattering set. Both land in `data/<name>/` alongside a `meta.json`
 recording the cluster they were computed for. Point the model at them with
 `Spectrum(tables_name=..., ms_name=...)`.
 
+### Native tables (no FEFF, no larch)
+
+`native_tables.py` takes the same arguments and writes the same files, from
+CHIMERA's own ab initio engine (`exafs_gpu/abinitio/`):
+
+```bash
+python native_tables.py --elements Cr Co Ni --d-nn 2.517 --name crconi_fcc2517_native
+python native_tables.py --elements Cr Co Ni --d-nn 2.517 --name crconi_fcc2517_native_ms \
+    --rpath 5.3 --nleg 4
+```
+
+The chain is FEFF's, written from the physics: self-consistent LDA atoms
+(ground state, and the absorber with a screened 1s hole), overlapped-atom
+muffin-tin potentials, the Hedin-Lundqvist plasmon-pole self-energy (energy-
+dependent exchange and the mean free path), complex phase shifts, path
+enumeration with degeneracies, and an exact curved-wave multiple-scattering
+path sum in the angular-momentum basis - no Rehr-Albers separable truncation.
+Phase shifts, the loss integral and the path sum are compiled CUDA kernels; a
+full multiple-scattering set takes about 3 s per absorber on an RTX 4090.
+
+Checked against independent references (`tests/test_abinitio_*.py` on the
+development branch): the atoms reproduce the NIST LDA tables to 1e-6 Ha; the
+path list and degeneracies reproduce FEFF8L's exactly; single-scattering
+amplitudes agree with FEFF8L to 1-2% (10% at p = 4 A^-1, where FEFF adds a
+sub-threshold loss) with a slowly varying phase offset of 0.1-0.3 rad, larger
+where Cr scatters. That offset is FEFF8L's self-consistent potential, which
+the native engine does not have yet (it uses overlapped atoms, so its Fermi
+level and Cr charge differ). Fitted to Kuzmin's Cu and Cr foil temperature
+series with one Debye temperature, the native tables give S0^2 = 0.87 and
+theta_D = 323 K for Cu (literature 315-330 K) and R-factors of 0.02-0.04
+(`scripts/test_native_foils.py`).
+
+## Blind synthetic data
+
+`scripts/make_blind_dataset.py` writes a CrCoNi pressure series in the staged
+export layout, generated from an atomistic model that shares none of the
+fit's approximations: chemical order from Monte Carlo on random pair
+interactions (a no-order control one time in four), Morse-bonded Langevin
+dynamics at 300 K, single scattering for every pair of every snapshot and
+multiple scattering computed exactly on the distorted geometry, with S0^2,
+E0 offsets, a smooth theory error, noise and a residual background drawn at
+random. The answer is sealed with a passphrase and committed to by its
+SHA-256 in the dataset's `manifest.json`:
+
+```bash
+python scripts/make_blind_dataset.py --out ".../Blind/blind_001" --key-dir ".../Blind_keys"
+python scripts/run_all.py ...                        # fit it like any measured series
+python scripts/unblind.py --data ".../Blind/blind_001" --tree <results tree> \
+    --key ".../Blind_keys/blind_001.KEY.txt"
+```
+
 ## Using it
 
 ```python
@@ -146,6 +197,10 @@ chimera/
   fitrun.py        one spectrum: refine lattice, sample, bounds, systematic band
   figures.py       fit comparison, partial RDFs, alpha by shell
 exafs_gpu/
+  abinitio/        native scattering engine: atom.py, potential.py,
+                   selfenergy.py, phaseshift.py, sphere.py, pathsum.py,
+                   paths.py, cluster.py, tables.py; synth.py builds the
+                   blind synthetic data
   scattering.py    scattering tables; FEFF8L reader and convention conversion
   lattice.py       supercell, neighbour lists, force constants, Warren-Cowley
   forward.py       GPU forward model and analytic adjoint
@@ -166,8 +221,10 @@ scripts/
                    (development branch only)
 tools/
   promote_to_main.py   builds main from development (see Branches)
+  make_blind_dataset.py, unblind.py   blind synthetic series and their scoring
 feff8l_tables.py   generates data/ for an alloy on sc, bcc, fcc or hcp
                    (needs xraylarch)
+native_tables.py   the same tables from exafs_gpu/abinitio, no FEFF needed
 ```
 
 ## Branches
