@@ -51,8 +51,9 @@ import numpy as np
 from .chik import ChiK, Window, transform, make_window
 from exafs_gpu.fourier import r_grid
 
-ELEMENTS = ("Cr", "Co", "Ni")
-PRESSURES = (0, 3, 7, 10)
+from exafs_gpu.scattering import ELEMENTS        # the default system's edges
+PRESSURES = (0, 3, 7, 10)                          # the CrCoNi series; a tree's
+                                                   # own points are discovered
 PEAK_LO, PEAK_HI = 1.5, 3.0
 BASE_LO = 8.0
 AMP_TOL = 3.0
@@ -62,18 +63,53 @@ KINDS = ("mag_R", "chi_k")
 QC_WINDOW = Window(3.0, 13.0, (3,), 1.0)     # for screening chi(k) folders only
 
 
-def _folder(data_root, el, P):
+SERIES_UNIT = "GPa"       # what follows the series index in a folder name
+
+
+class Spectra(dict):
+    """{(P, element): entry} as `screen` returns it, carrying the element
+    order the fit uses (`elements`) and the series points found (`series`)."""
+    elements = ELEMENTS
+    series = ()
+
+
+def _els(spectra, elements=None):
+    """The element order to use: the caller's, else the tree's, else the default."""
+    if elements is not None:
+        return tuple(elements)
+    return tuple(getattr(spectra, "elements", ELEMENTS))
+
+
+def _folder_re(el, unit=SERIES_UNIT):
+    return re.compile(rf"(?:.*?[_-])?{el}[_-]?(\d+)\s*{unit}", re.I)
+
+
+def _folder(data_root, el, P, unit=SERIES_UNIT):
     """The folder for one (element, series point).
 
     Accepts `Cr_0GPa` and the export variants seen in practice: an arbitrary
     prefix, with or without the separator (`chik_Cr0GPa`, `rdf_Cr0GPa`), any
     case.
     """
+    pat = _folder_re(el, unit)
     for d in os.listdir(data_root):
-        m = re.fullmatch(rf"(?:.*?[_-])?{el}[_-]?(\d+)\s*GPa", d, re.I)
+        m = pat.fullmatch(d)
         if m and int(m.group(1)) == P:
             return os.path.join(data_root, d)
-    raise FileNotFoundError(f"no folder for {el} {P} GPa in {data_root}")
+    raise FileNotFoundError(f"no folder for {el} {P} {unit} in {data_root}")
+
+
+def discover(data_root, elements=None, unit=SERIES_UNIT):
+    """The series points present for ANY of `elements` (default: the default
+    system's), read off the folder names, sorted."""
+    els = tuple(elements) if elements is not None else ELEMENTS
+    found = set()
+    for d in os.listdir(data_root):
+        for el in els:
+            m = _folder_re(el, unit).fullmatch(d)
+            if m:
+                found.add(int(m.group(1)))
+    return sorted(found)
 
 
 def _index(folder):
@@ -179,10 +215,39 @@ def load_one(path, kind=None):
     return d[:, 0], d[:, col], kind
 
 
-def scan(data_root):
-    """{(P, element): {sample_index: path}} for the whole tree."""
-    return {(P, el): _index(_folder(data_root, el, P))
-            for P in PRESSURES for el in ELEMENTS}
+def scan(data_root, pressures=None, strict=False, elements=None):
+    """{(P, element): {sample index: path}} for the whole tree.
+
+    `pressures` defaults to every series point found for any of `elements`
+    (default: the default system's edges). A series point with no folder is
+    skipped rather than raised on: a dataset need not cover the full nominal
+    series (the 2026-09-16 "Fine" scans have no 0 GPa). A series point with
+    SOME of its edges present is a different matter - that is a missing
+    folder, not a missing pressure - so it is reported either way, and
+    refused under `strict`.
+    """
+    els = tuple(elements) if elements is not None else ELEMENTS
+    if pressures is None:
+        pressures = discover(data_root, els)
+    out, partial = {}, []
+    for P in pressures:
+        found = {}
+        for el in els:
+            try:
+                found[el] = _index(_folder(data_root, el, P))
+            except FileNotFoundError:
+                pass
+        if not found:
+            continue                      # this series point is simply absent
+        if len(found) < len(els):
+            partial.append((P, sorted(set(els) - set(found))))
+        out.update({(P, el): v for el, v in found.items()})
+    if partial:
+        msg = "; ".join(f"{P} GPa has no " + ", ".join(m) for P, m in partial)
+        if strict:
+            raise FileNotFoundError(msg)
+        print(f"  !! incomplete series point(s): {msg} - cannot be fitted")
+    return out
 
 
 def quality(R, chi):
@@ -191,16 +256,22 @@ def quality(R, chi):
     return pk, base, pk / max(base, 1e-12)
 
 
-def screen(data_root, verbose=False, kind=None, qc_window=QC_WINDOW):
+def screen(data_root, verbose=False, kind=None, qc_window=QC_WINDOW,
+           pressures=None, elements=None):
     """Load everything, apply the QC cuts, return (spectra, report).
 
     spectra[(P, el)] = dict(R=..., chi={sample: |chi(R)|}, rejected={sample: why},
                             kind=..., and for chi(k) files k=..., chi_k={sample: chi(k)})
 
+    `spectra` is a `Spectra` dict carrying `.elements` (the edge order, from
+    `elements` or the default system) and `.series` (the points found).
     `kind` forces the file kind; by default it is read off each file.
     """
-    idx = scan(data_root)
-    spectra, report = {}, []
+    els = tuple(elements) if elements is not None else ELEMENTS
+    idx = scan(data_root, pressures, elements=els)
+    spectra, report = Spectra(), []
+    spectra.elements = els
+    spectra.series = tuple(sorted({P for (P, _el) in idx}))
     for (P, el), files in sorted(idx.items()):
         raw, raw_k, qual, kinds = {}, {}, {}, set()
         xs, ys, keys = [], [], []
@@ -277,9 +348,9 @@ def screen(data_root, verbose=False, kind=None, qc_window=QC_WINDOW):
     return spectra, report
 
 
-def has_chi_k(spectra, P):
+def has_chi_k(spectra, P, elements=None):
     """True when every edge at pressure P holds chi(k)."""
-    return all(spectra[(P, el)].get("kind") == "chi_k" for el in ELEMENTS)
+    return all(spectra[(P, el)].get("kind") == "chi_k" for el in _els(spectra, elements))
 
 
 def _same_data(A, B, tol):
@@ -300,7 +371,12 @@ def _same_data(A, B, tol):
     return bool(np.median(rel) < tol), len(common), float(np.max(rel))
 
 
-def duplicate_edges(spectra, tol=1e-8):
+def series_points(spectra):
+    """The series points actually present in a screened tree."""
+    return sorted({P for (P, _el) in spectra})
+
+
+def duplicate_edges(spectra, tol=1e-8, elements=None):
     """Folders holding the same data - a provenance error in the export.
 
     Checked BOTH ways round, because both have been seen in this dataset:
@@ -313,16 +389,19 @@ def duplicate_edges(spectra, tol=1e-8):
     pair.
     """
     out = {}
-    for P in PRESSURES:
-        for a, b in (("Co", "Ni"), ("Cr", "Co"), ("Cr", "Ni")):
-            if (P, a) not in spectra or (P, b) not in spectra:
-                continue
-            dup, n, mx = _same_data(spectra[(P, a)], spectra[(P, b)], tol)
-            if dup:
-                out[(P, a, b)] = dict(n=n, max_rel=mx, kind="edges")
-    for el in ELEMENTS:
-        for i, P in enumerate(PRESSURES):
-            for Q in PRESSURES[i + 1:]:
+    els = _els(spectra, elements)
+    P_all = series_points(spectra)
+    for P in P_all:
+        for i, a in enumerate(els):
+            for b in els[i + 1:]:
+                if (P, a) not in spectra or (P, b) not in spectra:
+                    continue
+                dup, n, mx = _same_data(spectra[(P, a)], spectra[(P, b)], tol)
+                if dup:
+                    out[(P, a, b)] = dict(n=n, max_rel=mx, kind="edges")
+    for el in els:
+        for i, P in enumerate(P_all):
+            for Q in P_all[i + 1:]:
                 if (P, el) not in spectra or (Q, el) not in spectra:
                     continue
                 dup, n, mx = _same_data(spectra[(P, el)], spectra[(Q, el)], tol)
@@ -348,26 +427,26 @@ def describe_duplicates(dups):
     return out
 
 
-def locations(spectra, P, require_all=True):
+def locations(spectra, P, require_all=True, elements=None):
     """Sample indices usable at pressure P."""
-    sets = [set(spectra[(P, el)]["chi"]) for el in ELEMENTS]
+    sets = [set(spectra[(P, el)]["chi"]) for el in _els(spectra, elements)]
     return sorted(set.intersection(*sets) if require_all else set.union(*sets))
 
 
 # ------------------------------------------------------------------ |chi(R)|
-def stack(spectra, P, sample):
-    """(3, nR) array of |chi(R)| for one location, ordered as ELEMENTS."""
-    return np.array([spectra[(P, el)]["chi"][sample] for el in ELEMENTS])
+def stack(spectra, P, sample, elements=None):
+    """(nsp, nR) array of |chi(R)| for one location, in element order."""
+    return np.array([spectra[(P, el)]["chi"][sample] for el in _els(spectra, elements)])
 
 
-def average(spectra, P, samples=None, robust=True):
-    """Location-averaged |chi(R)| per edge, (3, nR).
+def average(spectra, P, samples=None, robust=True, elements=None):
+    """Location-averaged |chi(R)| per edge, (nsp, nR).
 
     Uses the median over positions by default: the maps contain occasional
     hot positions that survive the QC cut but still skew a mean.
     """
     out = []
-    for el in ELEMENTS:
+    for el in _els(spectra, elements):
         d = spectra[(P, el)]["chi"]
         keys = sorted(d) if samples is None else [s for s in samples if s in d]
         A = np.array([d[s] for s in keys])
@@ -375,10 +454,10 @@ def average(spectra, P, samples=None, robust=True):
     return np.array(out)
 
 
-def spread(spectra, P, samples=None):
-    """Robust per-point scatter of |chi(R)| over locations (1.4826 * MAD), (3, nR)."""
+def spread(spectra, P, samples=None, elements=None):
+    """Robust per-point scatter of |chi(R)| over locations (1.4826 * MAD), (nsp, nR)."""
     out = []
-    for el in ELEMENTS:
+    for el in _els(spectra, elements):
         d = spectra[(P, el)]["chi"]
         keys = sorted(d) if samples is None else [s for s in samples if s in d]
         A = np.array([d[s] for s in keys])
@@ -388,38 +467,41 @@ def spread(spectra, P, samples=None):
 
 
 # ------------------------------------------------------------------ chi(k)
-def stack_k(spectra, P, sample):
+def stack_k(spectra, P, sample, elements=None):
     """ChiK for one location (needs chi(k) files at every edge)."""
-    assert has_chi_k(spectra, P), f"{P} GPa: not every edge holds chi(k)"
-    return ChiK([spectra[(P, el)]["k"] for el in ELEMENTS],
-                [spectra[(P, el)]["chi_k"][sample] for el in ELEMENTS],
-                elements=ELEMENTS)
+    els = _els(spectra, elements)
+    assert has_chi_k(spectra, P, els), f"{P} GPa: not every edge holds chi(k)"
+    return ChiK([spectra[(P, el)]["k"] for el in els],
+                [spectra[(P, el)]["chi_k"][sample] for el in els],
+                elements=els)
 
 
-def average_k(spectra, P, samples=None, robust=True):
+def average_k(spectra, P, samples=None, robust=True, elements=None):
     """Location-median chi(k) per edge as a ChiK (point-wise in k; the
     transform is linear, so this is the median spectrum's transform up to
     the median-vs-mean difference)."""
-    assert has_chi_k(spectra, P), f"{P} GPa: not every edge holds chi(k)"
+    els = _els(spectra, elements)
+    assert has_chi_k(spectra, P, els), f"{P} GPa: not every edge holds chi(k)"
     k, chi = [], []
-    for el in ELEMENTS:
+    for el in els:
         d = spectra[(P, el)]["chi_k"]
         keys = sorted(d) if samples is None else [s for s in samples if s in d]
         A = np.array([d[s] for s in keys])
         chi.append(np.median(A, axis=0) if robust else A.mean(axis=0))
         k.append(spectra[(P, el)]["k"])
-    return ChiK(k, chi, elements=ELEMENTS)
+    return ChiK(k, chi, elements=els)
 
 
-def fit_input(spectra, P, sample=None, robust=True):
+def fit_input(spectra, P, sample=None, robust=True, elements=None):
     """What the fit should be given at pressure P: a ChiK when chi(k) was
     measured, the |chi(R)| array otherwise. One location with `sample`, the
     location median without."""
-    if has_chi_k(spectra, P):
-        return stack_k(spectra, P, sample) if sample is not None \
-            else average_k(spectra, P, robust=robust)
-    return stack(spectra, P, sample) if sample is not None \
-        else average(spectra, P, robust=robust)
+    els = _els(spectra, elements)
+    if has_chi_k(spectra, P, els):
+        return stack_k(spectra, P, sample, els) if sample is not None \
+            else average_k(spectra, P, robust=robust, elements=els)
+    return stack(spectra, P, sample, els) if sample is not None \
+        else average(spectra, P, robust=robust, elements=els)
 
 
 # ------------------------------------------------------------------ noise

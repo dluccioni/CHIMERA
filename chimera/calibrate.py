@@ -93,18 +93,27 @@ from . import dataio as io
 from . import model as M
 from . import shellmodel as SM
 from .chik import ChiK, as_kweights, kweight_label, kweight_value
+from .system import pair_labels
 
-A0_AMBIENT = 3.566        # equiatomic CrCoNi, literature
+A0_AMBIENT = 3.566        # equiatomic CrCoNi, literature (the default system)
+A0_BOUNDS_REL = (0.953, 1.0236)   # search range for a0 relative to the reference
 FIT_RMIN, FIT_RMAX = 1.4, 5.0
 FIT_RMAX_NOMS = 4.2       # where a single-scattering model has to stop
 KMIN, KMAX, KWEIGHT = 3.0, 13.0, 3
 KWEIGHTS_MAG = (2, 3, 4)          # scanned, for |chi(R)| files
 KWEIGHTS_CHIK = ((1, 2, 3),)      # fitted together, for chi(k) files
-DR_LABELS = [f"{ELEMENTS[a]}{ELEMENTS[b]}" for a, b in zip(*np.triu_indices(NSP))]
+DR_LABELS = pair_labels(ELEMENTS)        # the default system's pair labels
 
 
 def fit_mask(R, rmin=FIT_RMIN, rmax=FIT_RMAX):
     return (R > rmin) & (R < rmax)
+
+
+def mean_zero(u):
+    """A per-edge vector with the last entry fixed so the sum vanishes: the
+    nsp-1 free numbers of a mean-zero per-edge shift."""
+    u = np.atleast_1d(np.asarray(u, float))
+    return np.append(u, -u.sum())
 
 
 def _averages(spectra, pressures=None):
@@ -129,24 +138,33 @@ class Stage1:
     def __init__(self, sm, comp, ms=True, free_window=True, free_dr=True,
                  free_c3=True, free_shell_sigma=True, dE0_bounds=(-5.0, 35.0),
                  window_bounds=((2.5, 4.0), (11.0, 15.0)), with_sigma=True,
-                 free_a0=False, a0_bounds=(3.40, 3.65),
-                 free_c4=False, free_sigma_pair=False, free_ms_edge=False):
+                 free_a0=False, a0_bounds=None,
+                 free_c4=False, free_sigma_pair=False, free_ms_edge=False,
+                 elements=None):
         self.sm, self.comp = sm, np.asarray(comp, float)
+        self.nsp = int(self.comp.size)
+        els = (tuple(elements) if elements is not None
+               else tuple(sm.elements) if getattr(sm, "elements", None)
+               else tuple(f"e{i}" for i in range(self.nsp)))
+        self.elements = els
+        labels = pair_labels(els)
+        if a0_bounds is None:
+            a0_bounds = (sm.a0_ref * A0_BOUNDS_REL[0], sm.a0_ref * A0_BOUNDS_REL[1])
         self.names, self.bounds = [], []
 
         def add(name, lo, hi):
             self.names.append(name); self.bounds.append((float(lo), float(hi)))
 
-        for e in range(NSP):
-            add(f"dE0_{ELEMENTS[e]}", *dE0_bounds)
+        for e in range(self.nsp):
+            add(f"dE0_{els[e]}", *dE0_bounds)
         self.with_sigma = bool(with_sigma)
         if with_sigma:
             add("log_sigma", np.log(0.5), np.log(6.0))
         self.nsss = sm.nshell - 1 if free_shell_sigma else 0
         for s in range(1, sm.nshell) if free_shell_sigma else ():
             add(f"log_sigma_shell{s + 1}", np.log(0.4), np.log(2.5))
-        self.ndr = len(DR_LABELS) - 1 if free_dr else 0
-        for lab in DR_LABELS[:self.ndr]:
+        self.ndr = len(labels) - 1 if free_dr else 0
+        for lab in labels[:self.ndr]:
             add(f"dr_{lab}", -0.06, 0.06)
         self.c3 = bool(free_c3)
         if free_c3:
@@ -157,8 +175,8 @@ class Stage1:
         if free_c4:
             add("c4", -3e-5, 3e-5)
         # per-pair-type width in the first shell, log scale, mean fixed
-        self.nsp_pair = (len(DR_LABELS) - 1) if free_sigma_pair else 0
-        for lab in DR_LABELS[:self.nsp_pair]:
+        self.nsp_pair = (len(labels) - 1) if free_sigma_pair else 0
+        for lab in labels[:self.nsp_pair]:
             add(f"logs2_{lab}", -0.7, 0.7)
         self.ms = bool(ms)
         if ms:
@@ -166,8 +184,8 @@ class Stage1:
             add("log_ms_c", np.log(0.4), np.log(3.0))
         # one MS amplitude per absorber on top of the global one
         self.ms_edge = bool(ms and free_ms_edge)
-        for e in range(NSP - 1) if self.ms_edge else ():
-            add(f"log_ms_{ELEMENTS[e]}", -0.5, 0.5)
+        for e in range(self.nsp - 1) if self.ms_edge else ():
+            add(f"log_ms_{els[e]}", -0.5, 0.5)
         self.window = bool(free_window)
         if free_window:
             add("kmin", *window_bounds[0])
@@ -180,7 +198,7 @@ class Stage1:
     def unpack(self, x):
         x = np.asarray(x, float)
         i = 0
-        p = dict(dE0=x[i:i + NSP].copy()); i += NSP
+        p = dict(dE0=x[i:i + self.nsp].copy()); i += self.nsp
         if self.with_sigma:
             p["sigma_scale"] = float(np.exp(x[i])); i += 1
         if self.nsss:
@@ -199,10 +217,10 @@ class Stage1:
         if self.ms:
             p["ms_amp"] = float(np.exp(x[i])); p["ms_c"] = float(np.exp(x[i + 1])); i += 2
         if self.ms_edge:
-            u = np.zeros(NSP)
-            u[:NSP - 1] = x[i:i + NSP - 1]
+            u = np.zeros(self.nsp)
+            u[:self.nsp - 1] = x[i:i + self.nsp - 1]
             u[-1] = -u[:-1].sum()          # geometric mean 1, so ms_amp keeps it
-            p["ms_amp_edge"] = np.exp(u); i += NSP - 1
+            p["ms_amp_edge"] = np.exp(u); i += self.nsp - 1
         if self.window:
             p["kmin"] = float(x[i]); p["kmax"] = float(x[i + 1]); i += 2
         if self.free_a0:
@@ -213,7 +231,7 @@ class Stage1:
         """A starting point: the defaults, overridden by `values` (a dict of
         name -> value) or by another Stage1's solution (`like` = (stage, x))."""
         defaults = dict(log_sigma=np.log(3.0), log_ms_amp=0.0, log_ms_c=np.log(1.3),
-                        kmin=3.0, kmax=13.0, a0=A0_AMBIENT)
+                        kmin=3.0, kmax=13.0, a0=self.sm.a0_ref)
         vals = {}
         if like is not None:
             other, xo = like
@@ -245,13 +263,25 @@ def _record(sm, N0, data, mask, idx, extra=None):
     return out
 
 
+def _win_str(kmin, kmax, elements=ELEMENTS):
+    """A readable window, whether it is one number or one per edge."""
+    lo, hi = np.atleast_1d(kmin), np.atleast_1d(kmax)
+    if lo.size == 1 and hi.size == 1:
+        return f"{float(lo[0]):.2f}-{float(hi[0]):.2f}"
+    n = max(lo.size, hi.size)
+    return ", ".join(f"{elements[e]} {float(lo[e % lo.size]):.2f}-"
+                     f"{float(hi[e % hi.size]):.2f}" for e in range(n))
+
+
 def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
-              rmin=FIT_RMIN, rmax=FIT_RMAX, a0_ambient=A0_AMBIENT, ms=True,
+              rmin=FIT_RMIN, rmax=FIT_RMAX, a0_ambient=None, ms=True,
               verbose=True, kweights=None, free_window=True, free_dr=True,
               free_c3=True, free_shell_sigma=True, free_dE0_per_pressure=False,
+              free_dE0_edge_per_pressure=False,
               joint=True, de_maxiter=120, de_popsize=12, seed=0, pressures=None,
               anchor_a0=True, free_c4=False, free_sigma_pair=False,
-              free_ms_edge=False, x0_values=None):
+              free_ms_edge=False, x0_values=None, system=None,
+              joint_a0=True):
     """Global calibration in pair-count space. Returns ({P: dict}, S).
 
     See the module docstring for what is fitted where. `S` is returned set to
@@ -261,7 +291,20 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
     one integer or several fitted together, e.g. `(2, 3, (1, 2, 3))`. The
     default is KWEIGHTS_MAG for |chi(R)| inputs and KWEIGHTS_CHIK for chi(k).
     `anchor_a0=False` frees the ambient lattice constant in stage 2 (chi(k)
-    data only; see the module docstring).
+    data only; see the module docstring). `a0_ambient` defaults to the
+    system's reference lattice constant. `system` names the alloy when `S`
+    is not given (see chimera/system.py).
+
+    `joint_a0` (the default) puts every pressure's a0 and sigma^2 scale -
+    and, when freed, its mean-zero per-edge E0 shift - into the joint stage
+    alongside the shared parameters, instead of holding them at their
+    stage-2 values. That is what lets the COMMON E0 settle where all the
+    pressures together put it: with a0 held, moving E0 is a step off the
+    a0/E0 ridge at every pressure at once and the joint stage cannot move
+    it, so it stayed wherever the first pressure's stage 1 left it, and the
+    per-pressure a0 then each walked their own stretch of the ridge in
+    stage 2 - which is a noisy equation of state. Off reproduces the
+    2026-09 behaviour.
     """
     AV = _averages(spectra, pressures)
     chik = any(isinstance(v, ChiK) for v in AV.values())
@@ -270,7 +313,7 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
             "cannot mix chi(k) and |chi(R)| inputs across pressures"
         if free_window and verbose:
             print("  chi(k) input: the k window is a choice, not a parameter - "
-                  f"holding it at {kmin}-{kmax} A^-1", flush=True)
+                  f"holding it at {_win_str(kmin, kmax)} A^-1", flush=True)
         free_window = False
     elif not anchor_a0:
         raise ValueError("anchor_a0=False needs chi(k) data: from |chi(R)| alone "
@@ -278,7 +321,12 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
     if kweights is None:
         kweights = KWEIGHTS_CHIK if chik else KWEIGHTS_MAG
     kweights = [as_kweights(k) for k in kweights]
-    S = S or M.Spectrum(kmin=kmin, kmax=kmax, kweight=kweight, ms=ms)
+    S = S or M.Spectrum(system=system, kmin=kmin, kmax=kmax, kweight=kweight, ms=ms)
+    nsp, els = S.nsp, S.elements
+    labels = pair_labels(els)
+    if a0_ambient is None:
+        a0_ambient = float(S.a0_ref)
+    a0_lo, a0_hi = S.a0_ref * A0_BOUNDS_REL[0], S.a0_ref * A0_BOUNDS_REL[1]
     idx = M.match_grid(S.R, R_data)
     mask = fit_mask(R_data, rmin, rmax)
     P0 = 0 if 0 in AV else min(AV)
@@ -297,10 +345,11 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
     flags = dict(ms=ms, free_window=free_window, free_dr=free_dr, free_c3=free_c3,
                  free_shell_sigma=free_shell_sigma, free_a0=not anchor_a0,
                  free_c4=free_c4, free_sigma_pair=free_sigma_pair,
-                 free_ms_edge=free_ms_edge)
+                 free_ms_edge=free_ms_edge, elements=els)
     stage = Stage1(sm, comp, **flags)
     core = Stage1(sm, comp, ms=ms, free_window=free_window, free_dr=False,
-                  free_c3=False, free_shell_sigma=False, free_a0=not anchor_a0)
+                  free_c3=False, free_shell_sigma=False, free_a0=not anchor_a0,
+                  elements=els)
     # stage 3 refits only the parameters COMMON to every pressure, and a0 is
     # not one of them - it is held per pressure there and refit by stage 2
     shared = Stage1(sm, comp, with_sigma=False, **{**flags, "free_a0": False})
@@ -320,32 +369,101 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
         kw = dict(sigma_scale=np.exp(y[0]))
         kw["a0"] = a0_ambient if anchored else y[1]
         if free_dE0_per_pressure:
-            kw["dE0"] = np.asarray(fixed["dE0"]) + y[-1]
+            # y is [log sigma_scale] + ([a0] unless anchored) + [common shift]
+            # + ([u, v] for the per-edge shift), so the common shift sits right
+            # after a0 - one slot earlier when this pressure is anchored.
+            kw["dE0"] = np.asarray(fixed["dE0"]) + y[1 if anchored else 2]
+        if free_dE0_edge_per_pressure:
+            # A MEAN-ZERO shift across the edges, nsp-1 free numbers. What is
+            # left is exactly the freedom a0 cannot absorb - one edge's
+            # distance scale moving relative to another's, which is what the
+            # measured per-edge compression anomaly looks like.
+            #
+            # The mean is excluded HERE because it is degenerate with a0, not
+            # because it is unmeasurable: `free_dE0_per_pressure` frees it, and
+            # on the 2026-09-16 export with per-edge windows the (a0, E0) plane
+            # was mapped (scripts/test_common_dE0.py) and the ridge is tilted
+            # but NOT flat - 3 of 169 cells lie within 2% of the minimum, and
+            # the peak-alignment contour is nearly horizontal, so the first-
+            # shell peak position is an E0 constraint rather than an a0 one.
+            # Free the two together or neither; one at a time is worse than
+            # neither. See testing/MODEL_CHANGES.md item 1.
+            kw["dE0"] = (np.asarray(kw.get("dE0", fixed["dE0"]), float)
+                         + mean_zero(y[-(nsp - 1):]))
         sm.set_params(**fixed); sm.set_params(**kw)
         return sm.r_factor(N0, data, mask, idx)
 
-    def stage2(p_shared, extra):
+    # index of the common dE0 shift inside y: after sigma_scale and, unless the
+    # pressure is anchored, a0. Anchored pressures shift it down by one, so it
+    # is resolved per pressure inside stage2 rather than assumed here.
+    def stage2(p_shared, extra, start=None):
+        """a0, sigma^2 (and the per-pressure E0 shifts) per pressure with the
+        shared parameters held. `start[P]` seeds the search from a previous
+        per-pressure solution (the joint stage's)."""
         fixed = {k: v for k, v in p_shared.items() if k not in ("a0", "sigma_scale")}
         out = {}
         for P in P_all:
             data, anchored = AV[P], (P == P0 and anchor_a0)
-            bounds2 = [(np.log(0.5), np.log(6.0))] + ([] if anchored else [(3.40, 3.65)])
-            y0 = [np.log(p_shared["sigma_scale"])] + ([] if anchored else [p_shared["a0"]])
+            st = (start or {}).get(P, {})
+            bounds2 = [(np.log(0.5), np.log(6.0))] + ([] if anchored else [(a0_lo, a0_hi)])
+            y0 = ([np.log(st.get("sigma_scale", p_shared["sigma_scale"]))]
+                  + ([] if anchored else [st.get("a0", p_shared["a0"])]))
             if free_dE0_per_pressure:
-                bounds2.append((-5.0, 5.0)); y0.append(0.0)
+                bounds2.append((-5.0, 5.0)); y0.append(st.get("dE0_shift", 0.0))
+            if free_dE0_edge_per_pressure:
+                bounds2 += [(-4.0, 4.0)] * (nsp - 1)
+                y0 += list(st.get("edge", np.zeros(nsp - 1)))
             r = differential_evolution(score2, bounds2, args=(data, anchored, fixed),
-                                       maxiter=60, popsize=10, x0=y0, **de)
+                                       maxiter=60, popsize=10, x0=np.clip(
+                                           y0, [b[0] for b in bounds2],
+                                           [b[1] for b in bounds2]), **de)
             score2(r.x, data, anchored, fixed)          # leave sm at the optimum
             out[P] = _record(sm, N0, data, mask, idx,
                              extra=dict(kmin=sm.p["kmin"], kmax=sm.p["kmax"],
                                         rmin=rmin, rmax=rmax, pressure=P,
                                         a0_anchored=anchored,
-                                        dE0_shift=(float(r.x[-1]) if free_dE0_per_pressure
-                                                   else 0.0), **extra))
+                                        dE0_shift=(
+                                            float(r.x[1 if anchored else 2])
+                                            if free_dE0_per_pressure else 0.0),
+                                        dE0_edge_shift=(
+                                            mean_zero(r.x[-(nsp - 1):]).tolist()
+                                            if free_dE0_edge_per_pressure
+                                            else [0.0] * nsp), **extra))
         return out
 
-    # ---- stage 3: the shared parameters against every pressure at once
-    def score3(x, kw, a0_P, sig_P):
+    # ---- stage 3: the shared parameters against every pressure at once,
+    # together with each pressure's own a0, sigma^2 scale and (when freed)
+    # mean-zero per-edge E0 shift. The per-pressure block of the vector is
+    # [a0 (unless anchored), log sigma_scale, u_1..u_{nsp-1}] per pressure.
+    nshared = len(shared.names)
+
+    def _per_pressure(x, i, P):
+        anchored = (P == P0 and anchor_a0)
+        q = {}
+        if anchored:
+            q["a0"] = a0_ambient
+        else:
+            q["a0"] = float(x[i]); i += 1
+        q["sigma_scale"] = float(np.exp(x[i])); i += 1
+        u = None
+        if free_dE0_edge_per_pressure:
+            u = np.asarray(x[i:i + nsp - 1], float); i += nsp - 1
+        return q, u, i
+
+    def score3(x, kw):
+        p = shared.unpack(x[:nshared])
+        base = np.asarray(p["dE0"], float)
+        tot, i = 0.0, nshared
+        for P in P_all:
+            q, u, i = _per_pressure(x, i, P)
+            if u is not None:
+                q["dE0"] = base + mean_zero(u)
+            sm.set_params(kweight=kw, **{**p, **q})
+            tot += sm.r_factor(N0, AV[P], mask, idx)
+        return tot / len(P_all)
+
+    def score3_held(x, kw, a0_P, sig_P):
+        """The 2026-09 joint stage: a0 and sigma^2 held per pressure."""
         p = shared.unpack(x)
         tot = 0.0
         for P in P_all:
@@ -388,19 +506,51 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
         if joint and len(P_all) > 1:
             a0_P = {P: out[P]["a0"] for P in P_all}
             sig_P = {P: out[P]["sigma_scale"] for P in P_all}
-            r3 = differential_evolution(score3, shared.bounds, args=(kw, a0_P, sig_P),
-                                        maxiter=max(de_maxiter // 2, 20), popsize=de_popsize,
-                                        x0=shared.x0(like=(stage, r.x)), **de)
-            p1 = shared.unpack(r3.x)
-            p1.setdefault("a0", a0_P[P0])
-            p1.update(kweight=kw, sigma_scale=sig_P[P0])
-            out = stage2(p1, dict())
+            if joint_a0:
+                b3 = list(shared.bounds)
+                x3 = list(shared.x0(like=(stage, r.x)))
+                for P in P_all:
+                    if not (P == P0 and anchor_a0):
+                        b3.append((max(a0_P[P] - 0.03, a0_lo), min(a0_P[P] + 0.03, a0_hi)))
+                        x3.append(a0_P[P])
+                    b3.append((np.log(0.5), np.log(6.0))); x3.append(np.log(sig_P[P]))
+                    if free_dE0_edge_per_pressure:
+                        sh = np.asarray(out[P].get("dE0_edge_shift", [0.0] * nsp))
+                        b3 += [(-4.0, 4.0)] * (nsp - 1); x3 += list(sh[:nsp - 1])
+                x3 = np.clip(x3, [b[0] for b in b3], [b[1] for b in b3])
+                r3 = differential_evolution(score3, b3, args=(kw,),
+                                            maxiter=max(de_maxiter // 2, 20),
+                                            popsize=de_popsize, x0=x3, **de)
+                p1 = shared.unpack(r3.x[:nshared])
+                start, i = {}, nshared
+                for P in P_all:
+                    q, u, i = _per_pressure(r3.x, i, P)
+                    start[P] = dict(a0=q["a0"], sigma_scale=q["sigma_scale"],
+                                    edge=(u if u is not None else np.zeros(nsp - 1)))
+                p1.setdefault("a0", start[P0]["a0"])
+                p1.update(kweight=kw, sigma_scale=start[P0]["sigma_scale"])
+                if verbose:
+                    a0s = ", ".join(f"{P}: {start[P]['a0']:.4f}" for P in P_all)
+                    print(f"  stage 3 (joint, a0 and sigma^2 per pressure free): "
+                          f"mean R={r3.fun:.5f}  dE0={np.round(p1['dE0'], 2)} eV  "
+                          f"a0={{{a0s}}}", flush=True)
+                out = stage2(p1, dict(), start=start)
+            else:
+                r3 = differential_evolution(score3_held, shared.bounds,
+                                            args=(kw, a0_P, sig_P),
+                                            maxiter=max(de_maxiter // 2, 20),
+                                            popsize=de_popsize,
+                                            x0=shared.x0(like=(stage, r.x)), **de)
+                p1 = shared.unpack(r3.x)
+                p1.setdefault("a0", a0_P[P0])
+                p1.update(kweight=kw, sigma_scale=sig_P[P0])
+                out = stage2(p1, dict())
             row["n_eval"] += int(r3.nfev)
         row["r_factor_joint"] = float(np.mean([out[P]["r_factor_ideal"] for P in P_all]))
         scan.append(row)
         if verbose:
             print(f"  {kweight_label(kw)}: mean R over {len(P_all)} pressure(s) = {row['r_factor_joint']:.5f}  "
-                  f"dr={dict(zip(DR_LABELS, np.round(np.array(p1.get('dr', np.zeros((NSP, NSP))))[np.triu_indices(NSP)], 4)))}"
+                  f"dr={dict(zip(labels, np.round(np.array(p1.get('dr', np.zeros((nsp, nsp))))[np.triu_indices(nsp)], 4)))}"
                   f"  C3={p1.get('c3', [0.0])[0]:.2e}  ms_amp={p1.get('ms_amp', 0):.3f} "
                   f"ms_c={p1.get('ms_c', 0):.2f}  sigma_shell={np.round(p1.get('sigma_shell_scale', np.ones(sm.nshell)), 2)}"
                   f"  [{time.time() - t0:.0f}s]", flush=True)
@@ -408,9 +558,13 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
             best = (row["r_factor_joint"], kw, dict(p1), out, r.x)
     _, kw_best, p_best, out, best_x1 = best
     shared_rec = dict(p_best, kweight_scan=scan, joint=bool(joint and len(P_all) > 1),
+                      joint_a0=bool(joint_a0),
                       free=dict(window=free_window, dr=free_dr, c3=free_c3,
-                                shell_sigma=free_shell_sigma),
-                      target_complex=bool(chik), a0_anchored=bool(anchor_a0))
+                                shell_sigma=free_shell_sigma,
+                                dE0_edge_per_pressure=bool(free_dE0_edge_per_pressure),
+                                dE0_common_per_pressure=bool(free_dE0_per_pressure)),
+                      target_complex=bool(chik), a0_anchored=bool(anchor_a0),
+                      a0_ambient=float(a0_ambient), system=S.system.to_dict())
     shared_rec["kweight"] = kweight_value(shared_rec["kweight"])
     # the raw stage-1 solution by parameter name, so a later call can start
     # from it (see `x0_values`)
@@ -451,8 +605,8 @@ def _objective(S, cfg, idx, data, mask):
 
 
 def calibrate_legacy(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
-                     rmin=FIT_RMIN, rmax=FIT_RMAX, a0_ambient=A0_AMBIENT,
-                     seeds=(0, 1, 2), ms=True, verbose=True):
+                     rmin=FIT_RMIN, rmax=FIT_RMAX, a0_ambient=None,
+                     seeds=(0, 1, 2), ms=True, verbose=True, system=None):
     """The original Nelder-Mead calibration on the GPU pair sum (no dr, C3 or
     per-shell sigma^2; window and k weight fixed). Kept for comparison.
 
@@ -465,7 +619,10 @@ def calibrate_legacy(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEI
     Averaging the objective over a few random configurations removes the
     residual sensitivity to which one was drawn.
     """
-    S = S or M.Spectrum(kmin=kmin, kmax=kmax, kweight=kweight, ms=ms)
+    S = S or M.Spectrum(system=system, kmin=kmin, kmax=kmax, kweight=kweight, ms=ms)
+    nsp = S.nsp
+    if a0_ambient is None:
+        a0_ambient = float(S.a0_ref)
     S.set_window(kmin, kmax, kweight)
     idx = M.match_grid(S.R, R_data)
     mask = fit_mask(R_data, rmin, rmax)
@@ -485,22 +642,22 @@ def calibrate_legacy(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEI
         return tot / len(cfgs)
 
     # ---- stage 1: dE0 at the anchored ambient lattice constant
-    data0 = AV[0]
+    data0 = AV[min(AV)]
     best = None
     for d in (4.0, 10.0, 16.0, 22.0):
-        x0 = [d, d + 8, d + 8, 0.4] + ([0.0, np.log(1.3)] if ms else [])
-        r = minimize(lambda p: score(a0_ambient, p[:3], p[3], data0,
-                                     *(p[4:6] if ms else ())),
+        x0 = [d] + [d + 8] * (nsp - 1) + [0.4] + ([0.0, np.log(1.3)] if ms else [])
+        r = minimize(lambda p: score(a0_ambient, p[:nsp], p[nsp], data0,
+                                     *(p[nsp + 1:nsp + 3] if ms else ())),
                      x0, method="Nelder-Mead",
                      options=dict(maxiter=1500, xatol=1e-3, fatol=1e-9))
         if best is None or r.fun < best.fun:
             best = r
-    dE0 = np.array(best.x[:3], float)
-    ms_amp = float(np.exp(best.x[4])) if ms else 0.0
-    ms_c = float(np.exp(best.x[5])) if ms else 0.0
+    dE0 = np.array(best.x[:nsp], float)
+    ms_amp = float(np.exp(best.x[nsp + 1])) if ms else 0.0
+    ms_c = float(np.exp(best.x[nsp + 2])) if ms else 0.0
     if verbose:
         print(f"  stage 1 (a0 := {a0_ambient} A): R={best.fun:.4f}  "
-              f"dE0={np.round(dE0, 2)} eV  sigma_scale={np.exp(best.x[3]):.2f}"
+              f"dE0={np.round(dE0, 2)} eV  sigma_scale={np.exp(best.x[nsp]):.2f}"
               + (f"  ms_amp={ms_amp:.3f} ms_c={ms_c:.2f}" if ms else ""))
 
     # ---- stage 2: a0 per pressure, dE0 fixed
@@ -508,7 +665,7 @@ def calibrate_legacy(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEI
     for P in sorted(AV):
         data = AV[P]
         b = None
-        for a0 in (3.50, 3.535, 3.566, 3.59):
+        for a0 in a0_ambient * np.array([0.9815, 0.9913, 1.0, 1.0067]):
             r = minimize(lambda p: score(p[0], dE0, p[1], data,
                                          *((np.log(ms_amp), np.log(ms_c)) if ms else ())),
                          [a0, 0.4], method="Nelder-Mead",
@@ -524,7 +681,8 @@ def calibrate_legacy(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEI
         scales = M.edge_scales(M.fit_scales(m, data, mask, S.chan_edge), S.chan_edge)
         nn = np.abs(np.linalg.norm((S.cell.ideal[S.j] + S.shift) - S.cell.ideal[S.i],
                                    axis=1) - S.shells[0]) < 0.05
-        out[P] = dict(a0=a0, nn_distance=float(S.shells[0]), sigma_scale=sig,
+        out[P] = dict(system=S.system.to_dict(),
+                      a0=a0, nn_distance=float(S.shells[0]), sigma_scale=sig,
                       multiple_scattering=bool(ms), ms_amp=ms_amp, ms_c=ms_c,
                       sigma2_nn=float(S.sigma2[nn].mean()), dE0=dE0.tolist(),
                       kmin=kmin, kmax=kmax, kweight=kweight,
@@ -588,7 +746,7 @@ def band_report(S, cfg, idx, data, R_data, scales=None):
     m = M.observe(S, cfg, tgt)[:, idx]
     if scales is None:
         scales = M.fit_scales(m, tgt, fit_mask(R_data), S.chan_edge)
-    elif np.size(scales) == NSP and S.nchan != NSP:
+    elif np.size(scales) == S.nsp and S.nchan != S.nsp:
         scales = np.asarray(scales)[S.chan_edge]
     m = m * np.asarray(scales)[:, None]
     if M.is_chik(data):

@@ -32,7 +32,6 @@ from __future__ import annotations
 import numpy as np
 
 from exafs_gpu.fourier import FourierTransform
-from exafs_gpu.scattering import NSP
 from . import multiscat
 from .model import k_exp_axis, fit_scales, edge_scales, r_factor, target as _target
 from .chik import Window, as_kweights, kweight_value, channel_edges
@@ -110,11 +109,18 @@ class ShellModel:
 
     def __init__(self, k_phys, tables, shells_ref, shell_mult, sigma2_shell_ref,
                  natoms, a0_ref=3.566, ms_paths=None, s02=1.0, dk_win=1.0,
-                 pairs=None):
+                 pairs=None, composition=None, elements=None, system=None):
         self.k = np.asarray(k_phys, float)
         _, f, delta, lam = tables.as_float64()
         self.f, self.delta, self.lam = f, delta, lam
         self.nsp = int(f.shape[0])
+        # the alloy: composition for the random-alloy expectation, elements
+        # for labels, the whole system for the records
+        comp = (np.ones(self.nsp) / self.nsp if composition is None
+                else np.asarray(composition, float))
+        self.composition = tuple(float(x) for x in comp / comp.sum())
+        self.elements = tuple(elements) if elements is not None else None
+        self.system = system
         self.shells_ref = np.asarray(shells_ref, float)
         self.nshell = int(self.shells_ref.size)
         self.z = np.asarray(shell_mult, float)
@@ -139,9 +145,12 @@ class ShellModel:
     # ---------------------------------------------------------- construction
     @classmethod
     def from_spectrum(cls, S):
+        sysm = getattr(S, "system", None)
         m = cls(S.k_phys, S.tables, S.shells_ref, S.shell_mult, S.sigma2_shell_ref,
                 S.cell.natoms, a0_ref=S.a0_ref, ms_paths=S.ms_paths, s02=S.s02,
-                dk_win=S.dk_win, pairs=(S.i, S.j, S.shell_idx))
+                dk_win=S.dk_win, pairs=(S.i, S.j, S.shell_idx),
+                composition=(sysm.composition if sysm is not None else None),
+                elements=getattr(S, "elements", None), system=sysm)
         m.set_params(a0=S.a0, dE0=S.dE0, kmin=S.kmin, kmax=S.kmax, kweight=S.kweights,
                      sigma_scale=S.sigma_scale, sigma_shell_scale=S.sigma_shell_scale,
                      dr=S.dr, c3=S.c3, ms_amp=getattr(S, "ms_amp", 1.0),
@@ -161,7 +170,8 @@ class ShellModel:
 
     def params(self):
         p = self.p
-        return dict(a0=p["a0"], dE0=p["dE0"].tolist(), kmin=p["kmin"], kmax=p["kmax"],
+        return dict(system=(self.system.to_dict() if self.system is not None else None),
+                    a0=p["a0"], dE0=p["dE0"].tolist(), kmin=p["kmin"], kmax=p["kmax"],
                     kweight=kweight_value(p["kweight"]), sigma_scale=p["sigma_scale"],
                     sigma_shell_scale=p["sigma_shell_scale"].tolist(),
                     dr=p["dr"].tolist(), c3=p["c3"].tolist(),
@@ -272,7 +282,7 @@ class ShellModel:
         if self._ms_key != key:
             ms = self.ms_paths.chi_fast(
                 sigma2_nn=s2nn, r_nn=r_nn, c_ms=p["ms_c"], amp=p["ms_amp"],
-                s02=self.s02, a_scale=r_nn / multiscat.D_NN_FEFF)
+                s02=self.s02, a_scale=r_nn / self.ms_paths.d_nn)
             # one amplitude per ABSORBER on top of the global one: the frozen
             # composition-averaged MS term cannot know which species lie along
             # each path, and a global amplitude fitted above 1 is that mismatch
@@ -317,7 +327,7 @@ class ShellModel:
     def random_counts(self, composition=None, counts=None):
         """Expected pair counts of a random alloy: N[a,b,s] = N_a z_s c_b."""
         if counts is None:
-            comp = (np.ones(self.nsp) / self.nsp if composition is None
+            comp = (np.asarray(self.composition, float) if composition is None
                     else np.asarray(composition, float))
             cnt = np.round(comp / comp.sum() * self.natoms).astype(int)
             cnt[-1] = self.natoms - cnt[:-1].sum()
@@ -373,8 +383,17 @@ NUISANCE_DEFAULT = ("a0", "sigma_scale", "ms_amp", "dE0", "dr", "c3")
 
 def crlb(model, N, data, sigma, mask, idx, shells=None, alpha_shell=0,
          nuisance=NUISANCE_DEFAULT, profile_scale=True,
-         threshold=0.3, steps=None, prior_sd=None):
+         threshold=0.3, steps=None, prior_sd=None, whiten=None):
     """Cramer-Rao bounds on the shell-`alpha_shell` Warren-Cowley parameters.
+
+    `whiten`, when given, replaces the diagonal noise model: it maps a
+    residual vector (ordered channel-major over the masked R points, Re then
+    Im for a complex target, in units of `sigma`) to its whitened form
+    L^-1 r for a covariance C = L L^T, so the Fisher matrix becomes
+    J^T C^-1 J. That is how a CORRELATED residual - model error with a
+    finite correlation length in R, or k-weight channels of one edge that
+    are transforms of the same chi(k) - enters the bound; see
+    scripts/correlated_bound.py. Pass sigma = 1 to hand it the raw residual.
 
     Linearises the target - |chi(R)|, or complex chi(R) for chi(k) data, in
     which case Re and Im are separate residuals - around the pair counts N
@@ -426,7 +445,8 @@ def crlb(model, N, data, sigma, mask, idx, shells=None, alpha_shell=0,
         m = model.observe(Nx, data, idx)
         sc = fit_scales(m, data, mask, chan_edge) if profile_scale else np.ones(nchan)
         r = (m * sc[:, None] - data)[:, mask] / sig[:, mask]
-        return np.concatenate([r.real.ravel(), r.imag.ravel()]) if cplx else r.ravel()
+        r = np.concatenate([r.real.ravel(), r.imag.ravel()]) if cplx else r.ravel()
+        return r if whiten is None else whiten(r)
 
     cols, A, names, prec = [], [], [], []
     for s in shells:
@@ -498,5 +518,12 @@ def crlb(model, N, data, sigma, mask, idx, shells=None, alpha_shell=0,
                 shells=[int(s) + 1 for s in shells],
                 nuisance=list(nuisance or ()), n_sro_directions=int(nsro),
                 eig_sd=eig_sd.tolist(), columns=names,
+                # the FULL 6x6 posterior covariance of the alpha_shell vector,
+                # not just its diagonal. The diagonal answers "how well is
+                # alpha_CrCr known"; the eigenvectors answer the more useful
+                # question of which COMBINATIONS the data determines, which for
+                # three nearly identical backscatterers is where the
+                # information actually lives (see scripts/alpha_modes.py).
+                alpha_cov=cov_alpha.tolist(),
                 nuisance_sd={k: (v[0] if len(v) == 1 else v) for k, v in nuis_sd.items()},
                 dr_entry_sd=dr_entry_sd)

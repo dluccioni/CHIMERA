@@ -42,11 +42,12 @@ from __future__ import annotations
 import os, glob
 import numpy as np
 
-from exafs_gpu.scattering import read_feffdat, ELEMENTS, NSP
+from exafs_gpu.scattering import read_feffdat, ELEMENTS, tables_root, _meta
 
 _ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                      "data")
-D_NN_FEFF = 2.517          # the cluster the paths were computed for
+D_NN_FEFF = 2.517          # the CrCoNi cluster the shipped paths were computed
+                           # for; a set's own meta.json overrides it
 
 
 def _read_path(fn):
@@ -56,12 +57,20 @@ def _read_path(fn):
 class MSPaths:
     """FEFF8L multiple-scattering paths for each absorber."""
 
-    def __init__(self, name="crconi_fcc2517_ms", elements=ELEMENTS, min_leg=3,
+    def __init__(self, name="crconi_fcc2517_ms", elements=None, min_leg=3,
                  rmax=None):
+        root = tables_root(name)
+        meta = _meta(root)
+        if elements is None:
+            elements = meta.get("elements") or ELEMENTS
         self.elements = tuple(elements)
+        self.name = name
+        # the nearest-neighbour spacing of the cluster the paths were computed
+        # for: every path length is rescaled from it to the fitted lattice
+        self.d_nn = float(meta.get("d_nn", D_NN_FEFF))
         self.paths = {}
         for a in self.elements:
-            folder = os.path.join(_ROOT, name, a)
+            folder = os.path.join(root, a)
             got = []
             for fn in sorted(glob.glob(os.path.join(folder, "feff0*.dat"))):
                 d = _read_path(fn)
@@ -144,6 +153,8 @@ _CACHE = {}
 
 
 def get(name="crconi_fcc2517_ms", **kw):
+    if "elements" in kw and kw["elements"] is not None:
+        kw["elements"] = tuple(kw["elements"])
     key = (name, tuple(sorted(kw.items())))
     if key not in _CACHE:
         _CACHE[key] = MSPaths(name, **kw)

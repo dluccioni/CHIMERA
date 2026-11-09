@@ -9,6 +9,22 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
 from exafs_gpu.scattering import ELEMENTS
+from .system import wc_labels
+
+# one colour per unordered pair, diagonal pairs first (the CrCoNi colours
+# are unchanged: Cr-Cr blue, Co-Co vermillion, Ni-Ni green, then the
+# cross pairs)
+PAIR_COLOURS = ["#0072B2", "#D55E00", "#009E73", "#56B4E9", "#CC79A7",
+                "#E69F00", "#000000", "#999999", "#8C564B", "#17BECF",
+                "#BCBD22", "#E377C2", "#2CA02C", "#9467BD", "#FF7F0E"]
+
+
+def pair_order(nsp):
+    """Unordered pairs with the like pairs first, then the unlike ones."""
+    like = [(a, a) for a in range(nsp)]
+    unlike = [(a, b) for a in range(nsp) for b in range(a + 1, nsp)]
+    return like + unlike
+
 
 C_DATA = "#1a1a1a"
 C_FIT = "#0072B2"
@@ -27,16 +43,18 @@ plt.rcParams.update({
 })
 
 
-def _channel_titles(n, labels):
+def _channel_titles(n, labels, elements=None):
     if labels is not None:
         return list(labels)
-    if n == len(ELEMENTS):
-        return [f"{e} edge" for e in ELEMENTS]
+    els = tuple(elements) if elements is not None else ELEMENTS
+    if n == len(els):
+        return [f"{e} edge" for e in els]
     return [f"channel {i}" for i in range(n)]
 
 
 def fit_comparison(path, R, data, model, ideal, mask, title, r_factor,
-                   r_factor_ideal, shells=None, spread=None, labels=None):
+                   r_factor_ideal, shells=None, spread=None, labels=None,
+                   elements=None):
     """One column per channel: data, reconstruction, and residual.
 
     Real arrays are |chi(R)| (two rows). Complex arrays - a fit to chi(k)
@@ -45,7 +63,7 @@ def fit_comparison(path, R, data, model, ideal, mask, title, r_factor,
     """
     n = data.shape[0]
     cplx = np.iscomplexobj(data)
-    titles = _channel_titles(n, labels)
+    titles = _channel_titles(n, labels, elements)
     nrow = 3 if cplx else 2
     heights = [2.2, 1.7, 1.0] if cplx else [2.6, 1.0]
     fig, axes = plt.subplots(nrow, n, figsize=(2.75 * n, 1.55 * sum(heights)),
@@ -114,13 +132,20 @@ def k_comparison(path, chik, S, species, scales, title, kweight=None, pos=None,
     """
     w = int(S.kweights[0] if kweight is None else kweight)
     n = chik.nsp
+    els = chik.elements or getattr(S, "elements", None) or ELEMENTS
     fig, axes = plt.subplots(1, n, figsize=(2.9 * n, 2.6), squeeze=False,
                              gridspec_kw=dict(wspace=0.28))
     chi_fit = S.chi_k(species, pos)
     chi_ideal = None if ideal_species is None else S.chi_k(ideal_species)
+    # kmin/kmax may be one number or one per edge (--per-edge-kmax), so each
+    # panel shades the window ITS edge is actually fitted under
+    lo_all = np.atleast_1d(S.kmin).ravel()
+    hi_all = np.atleast_1d(S.kmax).ravel()
     for e in range(n):
         ax = axes[0, e]
-        ax.axvspan(S.kmin, S.kmax, color=BAND, zorder=0, lw=0)
+        kmin_e = float(lo_all[e % lo_all.size])
+        kmax_e = float(hi_all[e % hi_all.size])
+        ax.axvspan(kmin_e, kmax_e, color=BAND, zorder=0, lw=0)
         ax.axhline(0, color=INK2, lw=0.6)
         k, y = chik.weighted(e, w)
         ax.plot(k, y, color=C_DATA, lw=1.3, zorder=3, label="measured")
@@ -131,9 +156,9 @@ def k_comparison(path, chik, S, species, scales, title, kweight=None, pos=None,
                     ls=(0, (4, 1.6)), zorder=2, label="ideal FCC")
         ax.plot(ke, ke ** w * chi_fit[e] * scales[e], color=C_FIT, lw=1.2,
                 ls=(0, (1.4, 1.4)), zorder=4, label="fit")
-        ax.set_xlim(max(0.0, S.kmin - 1.5), S.kmax + 1.5)
+        ax.set_xlim(max(0.0, kmin_e - 1.5), kmax_e + 1.5)
         ax.set_xlabel(r"$k$  (Å$^{-1}$)")
-        ax.set_title(f"{ELEMENTS[e]} edge", fontsize=8.5, pad=4)
+        ax.set_title(f"{els[e]} edge", fontsize=8.5, pad=4)
         ax.grid(zorder=0); ax.set_axisbelow(True)
         if e == 0:
             ax.set_ylabel(rf"$k^{w}\,\chi(k)$")
@@ -144,16 +169,16 @@ def k_comparison(path, chik, S, species, scales, title, kweight=None, pos=None,
     plt.close(fig)
 
 
-def rdf_figure(path, r, g, g_tot, shells, title, wc, wc_band=None):
+def rdf_figure(path, r, g, g_tot, shells, title, wc, wc_band=None, elements=None):
     """Partial RDFs, plus the Warren-Cowley values with their systematic band."""
+    els = tuple(elements) if elements is not None else ELEMENTS
+    nsp = len(els)
     fig, axes = plt.subplots(1, 2, figsize=(7.4, 2.9),
                              gridspec_kw=dict(width_ratios=[1.55, 1.0], wspace=0.32))
     ax = axes[0]
-    colors = {(0, 0): "#0072B2", (1, 1): "#D55E00", (2, 2): "#009E73",
-              (0, 1): "#56B4E9", (0, 2): "#CC79A7", (1, 2): "#E69F00"}
-    for (A, B), c in colors.items():
-        ax.plot(r, g[A, B], color=c, lw=1.2,
-                label=f"{ELEMENTS[A]}–{ELEMENTS[B]}")
+    for n, (A, B) in enumerate(pair_order(nsp)):
+        ax.plot(r, g[A, B], color=PAIR_COLOURS[n % len(PAIR_COLOURS)], lw=1.2,
+                label=f"{els[A]}–{els[B]}")
     ax.plot(r, g_tot, color=INK, lw=1.4, ls=(0, (4, 1.6)), label="total")
     for s in shells[:3]:
         ax.axvline(s, color=INK2, lw=0.6, ls=":")
@@ -165,8 +190,7 @@ def rdf_figure(path, r, g, g_tot, shells, title, wc, wc_band=None):
     ax.set_title("Partial RDFs", fontsize=8.5, pad=4)
 
     ax = axes[1]
-    labels = [f"$\\alpha_{{{ELEMENTS[i]}{ELEMENTS[j]}}}$"
-              for i, j in zip(*np.triu_indices(3))]
+    labels = wc_labels(els, tex=True)
     y = np.arange(len(labels))[::-1]
     if wc_band is not None:
         lo, hi = np.asarray(wc_band[0]), np.asarray(wc_band[1])
@@ -187,8 +211,9 @@ def rdf_figure(path, r, g, g_tot, shells, title, wc, wc_band=None):
     plt.close(fig)
 
 
-def pressure_summary(path, cal, per_pressure, wc_band):
+def pressure_summary(path, cal, per_pressure, wc_band, elements=None):
     """Lattice constant, sigma^2 and the WC band against pressure."""
+    els = tuple(elements) if elements is not None else ELEMENTS
     P = sorted(per_pressure)
     fig, axes = plt.subplots(1, 3, figsize=(7.6, 2.5), gridspec_kw=dict(wspace=0.34))
     a = [per_pressure[p]["a0"] for p in P]
@@ -206,13 +231,15 @@ def pressure_summary(path, cal, per_pressure, wc_band):
     ax.set_title(r"$\sigma^2_{\rm NN}$", fontsize=8.5, pad=4)
     ax.grid(zorder=0); ax.set_axisbelow(True)
     ax = axes[2]
-    labels = [f"$\\alpha_{{{ELEMENTS[i]}{ELEMENTS[j]}}}$"
-              for i, j in zip(*np.triu_indices(3))]
+    labels = wc_labels(els, tex=True)
     x = np.arange(len(labels))
+    pcol = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9",
+            "#000000", "#999999"]
+    wbar = 0.8 / max(len(P), 1)
     for n, p in enumerate(P):
         lo = np.array(wc_band[p]["wc_min"]); hi = np.array(wc_band[p]["wc_max"])
-        ax.bar(x + (n - 1.5) * 0.2, hi - lo, bottom=lo, width=0.18,
-               color=["#0072B2", "#D55E00", "#009E73", "#CC79A7"][n],
+        ax.bar(x + (n - (len(P) - 1) / 2) * wbar, hi - lo, bottom=lo, width=0.9 * wbar,
+               color=pcol[n % len(pcol)],
                label=f"{p} GPa", alpha=0.85)
     ax.axhline(0, color=INK2, lw=0.8)
     ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=6.5, rotation=30)

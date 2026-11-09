@@ -97,8 +97,11 @@ def make_window(obj):
         return obj.window
     kmin, kmax, kws = obj[0], obj[1], obj[2]
     dk_win = obj[3] if len(obj) > 3 else 1.0
-    # kmin/kmax stay as given: a scalar, or one value per edge
-    conv = (lambda v: float(v)) if np.isscalar(v0 := kmin) else (lambda v: np.asarray(v, float))
+    # kmin/kmax stay as given: a scalar, or one value per edge - and the two
+    # are decided independently. A per-edge kmax with a shared kmin is the
+    # normal production case (every edge starts at 3, each stops where its own
+    # data does), so kmin must not decide how kmax is read.
+    conv = lambda v: float(v) if np.isscalar(v) else np.asarray(v, float)
     return Window(conv(kmin), conv(kmax), as_kweights(kws), float(dk_win))
 
 

@@ -16,13 +16,30 @@ A-vs-B comparison is self-consistent. Absolute recovered values are only as
 good as the tables, so real analysis must swap in FEFF.
 """
 from __future__ import annotations
+import os
 import numpy as np
 from dataclasses import dataclass, field
 
-# Element registry for the CrCoNi system
+# Atomic numbers by symbol, H to U. The species of a fit come from the
+# AlloySystem (chimera/system.py); these are only the lookup behind it.
+SYMBOLS = ("H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co "
+           "Ni Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb "
+           "Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re "
+           "Os Ir Pt Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U").split()
+Z_TABLE = {s: i + 1 for i, s in enumerate(SYMBOLS)}
+
+# The default system - equiatomic CrCoNi - kept here by name so code written
+# against the constants keeps working. NOT a statement about what the
+# package can fit: see chimera/system.py.
 ELEMENTS = ("Cr", "Co", "Ni")
-Z_OF = {"Cr": 24, "Co": 27, "Ni": 28}
+Z_OF = {e: Z_TABLE[e] for e in ELEMENTS}
 NSP = len(ELEMENTS)
+
+
+def _meta(root):
+    import json
+    p = os.path.join(root, "meta.json")
+    return json.load(open(p)) if os.path.exists(p) else {}
 
 
 @dataclass
@@ -137,15 +154,25 @@ def read_feffdat(fn):
                 header="\n".join(lines[:i_geo]))
 
 
-def feff8l_tables(k, name="crconi_fcc2517", elements=ELEMENTS, s02=0.85):
+def tables_root(name):
+    """`data/<name>` under the package, or `name` when it is a directory."""
+    if os.path.isdir(name):
+        return name
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "data", name)
+
+
+def feff8l_tables(k, name="crconi_fcc2517", elements=None, s02=0.85, composition=None):
     """Tables from the FEFF8L alloy runs in data/<name>/.
 
     One run per absorber, produced by feff8l_tables.py; each holds the
-    nearest-neighbour single-scattering path to every species.
+    nearest-neighbour single-scattering path to every species. The element
+    list comes from the set's meta.json unless given.
     """
-    import os
-    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        "data", name)
+    root = tables_root(name)
+    if elements is None:
+        elements = tuple(_meta(root).get("elements") or ELEMENTS)
+    elements = tuple(elements)
     paths = {}
     for a in elements:
         d = os.path.join(root, a)
@@ -155,10 +182,11 @@ def feff8l_tables(k, name="crconi_fcc2517", elements=ELEMENTS, s02=0.85):
                 paths[(a, s)] = os.path.join(d, fn)
     missing = [(a, s) for a in elements for s in elements if (a, s) not in paths]
     assert not missing, f"FEFF8L runs lack pairs {missing}"
-    return ScatteringTables.from_feff(paths, np.asarray(k, float), elements, s02)
+    return ScatteringTables.from_feff(paths, np.asarray(k, float), elements, s02,
+                                      composition=composition)
 
 
-def default_tables(k, which=None, s02=0.85):
+def default_tables(k, which=None, s02=0.85, elements=None):
     """The tables the fitting scripts use.
 
     which: "feff8l" (real FEFF8L output - what produced the published results)
@@ -170,20 +198,24 @@ def default_tables(k, which=None, s02=0.85):
     which = which or os.environ.get("EXAFS_TABLES", "feff8l")
     k = np.asarray(k, float)
     if which == "feff8l":
-        return feff8l_tables(k, s02=s02)
+        return feff8l_tables(k, s02=s02, elements=elements)
     if which == "analytic":
-        return analytic_transition_metal_tables(k, s02=s02)
+        return analytic_transition_metal_tables(k, s02=s02, elements=elements)
     raise ValueError(f"unknown tables {which!r}; CHIMERA ships 'feff8l' and 'analytic'")
 
 
-def analytic_transition_metal_tables(k: np.ndarray, s02: float = 0.85) -> ScatteringTables:
-    """Physically-shaped stand-in tables for Cr / Co / Ni. See module docstring."""
+def analytic_transition_metal_tables(k: np.ndarray, s02: float = 0.85,
+                                     elements=None) -> ScatteringTables:
+    """Physically-shaped stand-in tables, parameterised by Z (tuned around
+    Cr / Co / Ni; any elements are accepted). See module docstring."""
+    elements = tuple(elements) if elements is not None else ELEMENTS
+    nsp = len(elements)
     k = np.asarray(k, np.float64)
     kk = np.maximum(k, 1e-6)
 
-    f = np.zeros((NSP, k.size))
-    for i, el in enumerate(ELEMENTS):
-        Z = Z_OF[el]
+    f = np.zeros((nsp, k.size))
+    for i, el in enumerate(elements):
+        Z = Z_TABLE[el]
         # log-normal envelope in k: peak position and amplitude drift with Z
         amp = 0.084 * Z ** 0.78
         kpeak = 3.55 + 0.021 * (Z - 24)
@@ -194,13 +226,13 @@ def analytic_transition_metal_tables(k: np.ndarray, s02: float = 0.85) -> Scatte
 
     # Phases. Central-atom phase dominates and is absorber-specific; the
     # scatterer contributes a weaker, Z-dependent term.
-    delta = np.zeros((NSP, NSP, k.size))
-    for ia, ea in enumerate(ELEMENTS):
-        Za = Z_OF[ea]
+    delta = np.zeros((nsp, nsp, k.size))
+    for ia, ea in enumerate(elements):
+        Za = Z_TABLE[ea]
         d_cen = (np.pi - 0.905 * kk + 0.0143 * kk ** 2
                  - 0.00031 * kk ** 3 - 0.0032 * (Za - 24))
-        for isc, es in enumerate(ELEMENTS):
-            Zs = Z_OF[es]
+        for isc, es in enumerate(elements):
+            Zs = Z_TABLE[es]
             d_sc = (-1.42 + 0.271 * kk - 0.00686 * kk ** 2
                     + 0.0121 * (Zs - 24) - 0.00042 * (Zs - 24) * kk)
             delta[ia, isc] = d_cen + d_sc
@@ -211,7 +243,8 @@ def analytic_transition_metal_tables(k: np.ndarray, s02: float = 0.85) -> Scatte
     lam = 59.57 / np.maximum(kk, 1.0) ** 2 + 0.794 * kk
     lam = np.clip(lam, 4.0, 30.0)
 
-    return ScatteringTables(k=k, f=f, delta=delta, lam=lam, s02=s02)
+    return ScatteringTables(k=k, f=f, delta=delta, lam=lam, s02=s02,
+                            meta=dict(route="analytic", elements=elements))
 
 
 def contrast_report(tab: ScatteringTables, labels=None) -> str:

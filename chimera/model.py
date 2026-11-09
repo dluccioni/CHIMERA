@@ -75,9 +75,11 @@ from __future__ import annotations
 import numpy as np
 import cupy as cp
 
-from exafs_gpu.scattering import feff8l_tables, ELEMENTS, NSP
+from exafs_gpu.scattering import (feff8l_tables, analytic_transition_metal_tables,
+                                  ScatteringTables, ELEMENTS, NSP)
 from exafs_gpu.lattice import (CrystalSupercell, force_constant_matrix,
                                warren_cowley, pair_vectors)
+from . import system as SYS
 from exafs_gpu.forward import ForwardModel, thermal_sigma2
 from exafs_gpu.fourier import FourierTransform
 from . import multiscat
@@ -102,18 +104,34 @@ class Spectrum:
     carried entirely by which k axis each edge is transformed against.
     """
 
-    def __init__(self, a0=3.566, dE0=(0.0, 0.0, 0.0), kmin=3.0, kmax=14.0,
+    def __init__(self, a0=None, dE0=0.0, kmin=3.0, kmax=14.0,
                  kweight=2, sigma_scale=1.0, k_bond=2.6, k_angle=0.35,
                  temperature=300.0, ncell=(5, 5, 5), rmax=6.2, dk_win=1.0,
-                 s02=1.0, tables_name="crconi_fcc2517", ms=True, ms_amp=1.0,
-                 ms_c=1.3, ms_name="crconi_fcc2517_ms", sigma_shell_scale=None,
-                 dr=None, c3=None):
-        self.a0_ref = 3.566
-        self.cell = CrystalSupercell("fcc", ncell, a0=self.a0_ref)
+                 s02=1.0, tables_name=None, ms=True, ms_amp=1.0,
+                 ms_c=1.3, ms_name=None, sigma_shell_scale=None,
+                 dr=None, c3=None, system=None, elements=None, composition=None,
+                 lattice=None, a0_ref=None, c_over_a=None, tables=None):
+        """`system` names the alloy (an AlloySystem, a table-set name, a dict
+        from a calibration record, or None for equiatomic fcc CrCoNi);
+        `elements`, `composition`, `lattice`, `a0_ref`, `c_over_a`,
+        `tables_name` and `ms_name` override its fields. `tables` is None
+        for the FEFF8L set the system names, "analytic" for the
+        Z-parameterised stand-in (tests), or a ScatteringTables. `a0`
+        defaults to the system's reference lattice constant, `dE0` (one
+        value, or one per edge) to zero.
+        """
+        self.system = SYS.resolve(system, elements=elements, composition=composition,
+                                  lattice=lattice, a0_ref=a0_ref, c_over_a=c_over_a,
+                                  tables_name=tables_name, ms_name=ms_name)
+        self.elements = self.system.elements
+        self.nsp = self.system.nsp
+        self.a0_ref = self.system.a0_ref
+        self.cell = CrystalSupercell(self.system.lattice, ncell, a0=self.a0_ref,
+                                     c_over_a=self.system.c_over_a)
         self.i, self.j, self.shift0, self.off = self.cell.neighbour_list(rmax)
         self.ideal0 = self.cell.ideal.copy()
         self.H0 = self.cell.H.copy()
-        self.tables_name, self.s02, self.dk_win = tables_name, s02, dk_win
+        self.tables_name, self.s02, self.dk_win = self.system.tables_name, s02, dk_win
         self.rmax = rmax
 
         Phi = force_constant_matrix(self.cell, self.i, self.j, self.shift0,
@@ -135,15 +153,32 @@ class Spectrum:
                                           for s in range(self.nshell)])
 
         self.k_phys = np.linspace(K_LO, K_HI, NKMODEL)
-        self.tables = feff8l_tables(self.k_phys, name=tables_name, s02=s02)
+        if isinstance(tables, ScatteringTables):
+            self.tables = tables
+        elif tables == "analytic" or (tables is None and self.tables_name == "analytic"):
+            # the Z-parameterised stand-in, also reachable by naming the
+            # table set "analytic" in the system (tests, dry runs)
+            self.tables = analytic_transition_metal_tables(self.k_phys, s02=s02,
+                                                           elements=self.elements)
+        else:
+            if self.tables_name is None:
+                raise ValueError(f"no FEFF tables named for {self.system.name}: pass "
+                                 f"tables_name= (see feff8l_tables.py) or tables=")
+            self.tables = feff8l_tables(self.k_phys, name=self.tables_name,
+                                        elements=self.elements, s02=s02,
+                                        composition=self.system.composition)
+        assert self.tables.nsp == self.nsp, (
+            f"tables hold {self.tables.nsp} species, the system {self.nsp}")
         self.fm = ForwardModel(self.cell, self.tables, self.i, self.j,
                                self.shift0, sigma2=self.sigma2_ref,
                                shell=self.shell_idx)
         self.R = None
-        self.ms_paths = (multiscat.get(ms_name).prepare(self.k_phys) if ms else None)
+        self.ms_paths = (multiscat.get(self.system.ms_name, elements=self.elements)
+                         .prepare(self.k_phys)
+                         if (ms and self.system.ms_name) else None)
         self.chi_ms = None
         self.sigma_shell_scale = np.ones(self.nshell)
-        self.set_a0(a0)
+        self.set_a0(self.a0_ref if a0 is None else a0)
         self.set_sigma_scale(sigma_scale, sigma_shell_scale)
         self.set_dr(dr)
         self.set_c3(c3)
@@ -181,8 +216,8 @@ class Spectrum:
 
     def set_dr(self, dr=None):
         """Nearest-neighbour bond-length offsets by pair type, (nsp, nsp) A."""
-        self.dr = (np.zeros((NSP, NSP)) if dr is None
-                   else np.asarray(dr, float).reshape(NSP, NSP))
+        self.dr = (np.zeros((self.nsp, self.nsp)) if dr is None
+                   else np.asarray(dr, float).reshape(self.nsp, self.nsp))
         self.fm.set_dr(self.dr)
         return self
 
@@ -207,7 +242,7 @@ class Spectrum:
         self.chi_ms = self.ms_paths.chi_fast(
             sigma2_nn=self.sigma2_nn(), r_nn=float(self.shells[0]),
             c_ms=self.ms_c, amp=self.ms_amp, s02=self.s02,
-            a_scale=float(self.shells[0]) / multiscat.D_NN_FEFF)
+            a_scale=float(self.shells[0]) / self.ms_paths.d_nn)
         return self
 
     def sigma2_nn(self):
@@ -226,16 +261,16 @@ class Spectrum:
         if kweight is not None:
             self.kweights = as_kweights(kweight)
         if dE0 is not None:
-            self.dE0 = np.atleast_1d(np.asarray(dE0, float)) * np.ones(NSP)
+            self.dE0 = np.atleast_1d(np.asarray(dE0, float)) * np.ones(self.nsp)
         self.ft = []
         lo = np.atleast_1d(self.kmin); hi = np.atleast_1d(self.kmax)
-        for e in range(NSP):
+        for e in range(self.nsp):
             k_exp = self.k_exp(e)
             for w in self.kweights:
                 self.ft.append(FourierTransform(k_exp, float(lo[e % lo.size]),
                                                 float(hi[e % hi.size]), w,
                                                 dk_win=self.dk_win, xp=cp))
-        self.chan_edge = channel_edges(NSP, len(self.kweights))
+        self.chan_edge = channel_edges(self.nsp, len(self.kweights))
         self.nchan = len(self.ft)
         self.R = self.ft[0].R
         return self
@@ -254,10 +289,11 @@ class Spectrum:
         return k_exp_axis(self.k_phys, self.dE0[e])
 
     def channel_labels(self):
-        return channel_labels(ELEMENTS, self.kweights)
+        return channel_labels(self.elements, self.kweights)
 
     def params(self):
-        return dict(a0=self.a0, dE0=[float(x) for x in self.dE0],
+        return dict(system=self.system.to_dict(),
+                    a0=self.a0, dE0=[float(x) for x in self.dE0],
                     kmin=self.kmin, kmax=self.kmax, kweight=self.kweight,
                     sigma_scale=self.sigma_scale,
                     sigma_shell_scale=self.sigma_shell_scale.tolist(),
@@ -271,7 +307,9 @@ class Spectrum:
     def from_cal(cls, cal, **overrides):
         """Build a Spectrum from a calibration dict (as written to
         calibration.json / fit.json), with keyword overrides on top."""
-        kw = dict(a0=cal["a0"], dE0=cal["dE0"], kmin=cal["kmin"], kmax=cal["kmax"],
+        sysd = cal.get("system") or cal.get("shared", {}).get("system")
+        kw = dict(system=SYS.AlloySystem.from_dict(sysd) if sysd else None,
+                  a0=cal["a0"], dE0=cal["dE0"], kmin=cal["kmin"], kmax=cal["kmax"],
                   kweight=cal["kweight"], sigma_scale=cal["sigma_scale"],
                   ms=bool(cal.get("multiple_scattering", True)),
                   ms_amp=cal.get("ms_amp", 1.0), ms_c=cal.get("ms_c", 1.3),
@@ -309,17 +347,20 @@ class Spectrum:
             out.append(cp.asnumpy(z if complex_out else cp.abs(z)))
         return np.array(out)
 
-    def random_config(self, seed=0, composition=(1 / 3, 1 / 3, 1 / 3)):
+    def random_config(self, seed=0, composition=None):
+        """A random arrangement at the system's composition (or `composition`),
+        species counts rounded with the last species taking the remainder."""
         n = self.cell.natoms
-        cnt = np.round(np.array(composition) * n).astype(int)
-        cnt[-1] = n - cnt[:-1].sum()
-        sp = np.repeat(np.arange(NSP), cnt).astype(np.int32)
+        comp = self.system.composition if composition is None else composition
+        cnt = SYS.integer_counts(comp, n)
+        sp = np.repeat(np.arange(self.nsp), cnt).astype(np.int32)
         np.random.default_rng(seed).shuffle(sp)
         return sp
 
     def warren_cowley(self, species, shell=0):
         return warren_cowley(np.asarray(species, np.int32), self.i, self.j,
-                             self.shift, self.cell, float(self.shells[shell]))
+                             self.shift, self.cell, float(self.shells[shell]),
+                             nsp=self.nsp)
 
 
 # --------------------------------------------------------------- comparison
@@ -399,7 +440,7 @@ def r_factor(model, data, mask, scales=None):
 
 
 # --------------------------------------------------------------- structure out
-def partial_rdf(species, cell, i_idx, j_idx, shift, r_edges, nsp=NSP):
+def partial_rdf(species, cell, i_idx, j_idx, shift, r_edges, nsp=None):
     """Partial radial distribution functions g_ab(r) from a configuration.
 
     g_ab(r) = n_ab(r) / (N_a * rho * c_b * V_shell): unity for a random
@@ -407,6 +448,7 @@ def partial_rdf(species, cell, i_idx, j_idx, shift, r_edges, nsp=NSP):
     integrals of 1 - g_ab/g_total.
     """
     sp = np.asarray(species, int)
+    nsp = int(sp.max()) + 1 if nsp is None else int(nsp)
     d = pair_vectors(cell, cell.ideal, i_idx, j_idx, shift)
     r = np.linalg.norm(d, axis=1)
     a, b = sp[i_idx], sp[j_idx]
@@ -426,9 +468,10 @@ def partial_rdf(species, cell, i_idx, j_idx, shift, r_edges, nsp=NSP):
     return centres, g, g_tot
 
 
-def coordination(species, cell, i_idx, j_idx, shift, r_cut, nsp=NSP):
+def coordination(species, cell, i_idx, j_idx, shift, r_cut, nsp=None):
     """N_ab: mean number of B neighbours of an A atom within r_cut."""
     sp = np.asarray(species, int)
+    nsp = int(sp.max()) + 1 if nsp is None else int(nsp)
     d = pair_vectors(cell, cell.ideal, i_idx, j_idx, shift)
     r = np.linalg.norm(d, axis=1)
     m = r <= r_cut
