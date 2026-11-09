@@ -35,6 +35,15 @@ ELEMENTS = ("Cr", "Co", "Ni")
 Z_OF = {e: Z_TABLE[e] for e in ELEMENTS}
 NSP = len(ELEMENTS)
 
+# Table-set name for paths the native engine computes in-process
+# (exafs_gpu.abinitio.provider): "native", or "native:<recipe options>".
+NATIVE = "native"
+
+
+def is_native(name):
+    """True when a table-set name asks for in-process native paths (no files)."""
+    return isinstance(name, str) and (name == NATIVE or name.startswith(NATIVE + ":"))
+
 
 def _meta(root):
     import json
@@ -102,15 +111,26 @@ class ScatteringTables:
         conversion (FEFF tabulates on k relative to the Fermi level and folds
         2(p-k)R into the phase; this pipeline needs the internal momentum p).
         """
+        return ScatteringTables.from_records(
+            {pair: read_feffdat(fn) for pair, fn in paths.items()}, k, elements, s02,
+            composition, route="FEFF8L")
+
+    @staticmethod
+    def from_records(records: dict, k: np.ndarray, elements=ELEMENTS, s02: float = 0.85,
+                     composition=None, route="FEFF8L", extra_meta=None) -> "ScatteringTables":
+        """Build tables from path records, (absorber, scatterer) -> the dict
+        `columns_to_record` makes: from files (`from_feff`) or handed over in
+        memory by the native engine (`exafs_gpu.abinitio.provider`)."""
+        k = np.asarray(k, float)
+        elements = tuple(elements)
         n = len(elements)
         comp = np.ones(n) / n if composition is None else np.asarray(composition, float)
         comp = comp / comp.sum()
         f_pair = np.zeros((n, n, k.size)); delta = np.zeros((n, n, k.size))
         lam_abs = np.zeros((n, k.size)); e0 = np.zeros(n)
         meta = {}
-        for (a, s), fn in paths.items():
+        for (a, s), d in records.items():
             ia, isc = elements.index(a), elements.index(s)
-            d = read_feffdat(fn)
             f_pair[ia, isc] = np.interp(k, d["p"], d["f"])
             delta[ia, isc] = np.interp(k, d["p"], d["delta"])
             lam_abs[ia] = np.interp(k, d["p"], d["lam"])
@@ -124,18 +144,34 @@ class ScatteringTables:
         lam = comp @ lam_abs
         return ScatteringTables(k=k, f=f, delta=delta, lam=lam, s02=s02,
                                 red=red, e0_offset_ev=float(comp @ e0),
-                                meta=dict(route="FEFF8L", pairs=meta,
-                                          f_pair=f_pair, elements=tuple(elements)))
+                                meta=dict(route=route, pairs=meta, f_pair=f_pair,
+                                          elements=elements, **(extra_meta or {})))
+
+
+def columns_to_record(cols, reff, deg=1.0, nleg=2, scatterer=None, header=""):
+    """One path's FEFF columns -> this pipeline's convention.
+
+    `cols` is (nk, 7): k, real[2*phc], mag[feff], phase[feff], red factor,
+    lambda, real[p], as in a feffNNNN.dat. FEFF: chi = amp/(k R^2)
+    exp(-2R/lam) sin(2 k R + pha), with k relative to the Fermi level,
+    amp = mag_feff * red_fact, pha = real[2*phc] + pha_feff, and real[p] the
+    internal momentum. On the p axis:
+        f(p) = amp * p/k,   delta(p) = pha - 2 (p - k) R_eff,   lam(p) = lam.
+    The file reader and the in-process native engine both go through here, so
+    both routes hand the fit the same numbers.
+    """
+    k, phc, mag, pha, red, lam, p = np.asarray(cols, float).T
+    sel = k > 0.3
+    k, phc, mag, pha, red, lam, p = (x[sel] for x in (k, phc, mag, pha, red, lam, p))
+    f = mag * red * p / k
+    delta = np.unwrap(phc + pha) - 2.0 * (p - k) * reff
+    e0 = float(np.interp(0.0, k, p) ** 2 / (2.0 / (27.211386245988 * 0.529177210903 ** 2)))
+    return dict(p=p, k=k, f=f, delta=delta, lam=lam, reff=float(reff), deg=float(deg),
+                nleg=int(nleg), scatterer=scatterer, e0_offset_ev=e0, header=header)
 
 
 def read_feffdat(fn):
-    """Parse one feffNNNN.dat and convert to this pipeline's convention.
-
-    FEFF: chi = amp/(k R^2) exp(-2R/lam) sin(2 k R + pha), with k relative to
-    the Fermi level, amp = mag_feff * red_fact, pha = real[2*phc] + pha_feff,
-    and real[p] the internal momentum. On the p axis:
-        f(p) = amp * p/k,   delta(p) = pha - 2 (p - k) R_eff,   lam(p) = lam.
-    """
+    """Parse one feffNNNN.dat and convert it with `columns_to_record`."""
     lines = open(fn).read().split("\n")
     i_hdr = next(i for i, ln in enumerate(lines) if ln.strip().startswith("k ") and "real[2*phc]" in ln)
     i_geo = next(i for i, ln in enumerate(lines) if "nleg, deg, reff" in ln)
@@ -143,15 +179,7 @@ def read_feffdat(fn):
     atoms = [ln.split() for ln in lines[i_geo + 2:i_hdr]]
     scatterer = atoms[1][5] if len(atoms) > 1 else None
     data = np.array([[float(x) for x in ln.split()] for ln in lines[i_hdr + 1:] if ln.strip()])
-    k, phc, mag, pha, red, lam, p = data.T
-    sel = k > 0.3
-    k, phc, mag, pha, red, lam, p = (x[sel] for x in (k, phc, mag, pha, red, lam, p))
-    f = mag * red * p / k
-    delta = np.unwrap(phc + pha) - 2.0 * (p - k) * reff
-    e0 = float(np.interp(0.0, k, p) ** 2 / (2.0 / (27.211386245988 * 0.529177210903 ** 2)))
-    return dict(p=p, k=k, f=f, delta=delta, lam=lam, reff=reff, deg=deg,
-                nleg=int(nleg), scatterer=scatterer, e0_offset_ev=e0,
-                header="\n".join(lines[:i_geo]))
+    return columns_to_record(data, reff, deg, nleg, scatterer, header="\n".join(lines[:i_geo]))
 
 
 def tables_root(name):

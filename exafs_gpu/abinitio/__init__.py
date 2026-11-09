@@ -16,6 +16,8 @@ ported:
                    (CUDA)
     tables.py      builds a table set and writes feffNNNN.dat-format files, so
                    everything downstream reads them exactly as it reads FEFF's
+    provider.py    the same paths computed in-process and handed to the fit
+                   in memory (table set "native"): no files, cached on disk
 
 Hartree atomic units inside; Angstrom and eV at the interfaces.
 """

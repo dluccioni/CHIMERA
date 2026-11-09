@@ -43,9 +43,34 @@ imports `larch` — the scattering tables are plain text read with numpy.
 
 ## Scattering tables
 
-The tables are **not** shipped; generate them for your alloy first. This is
-the only step that needs `xraylarch` (which bundles the FEFF8L binaries), and
-it runs in a *separate* interpreter that the main environment never imports:
+CHIMERA computes its own scattering paths, in-process, with no FEFF and no
+table files: name the table set `native`.
+
+```bash
+python scripts/run_all.py --data <root> --out <tree> --tables native
+python scripts/run_all.py ... --tables native --elements Fe Ni --lattice fcc --a0-ref 3.59
+```
+
+```python
+S = Spectrum(system="native")            # equiatomic fcc CrCoNi, paths computed here
+```
+
+The native engine (below) builds the nearest-neighbour single-scattering
+path for every absorber-scatterer pair and every 3- and 4-leg path to
+5.3 A, at the system's reference spacing, in about 4 s for CrCoNi; the
+result is cached in `data/_cache` (or `$CHIMERA_CACHE`), so later runs load
+it in under a second. `native:seed=1,rpath=5.8` changes the recipe (the
+random cluster, the path cutoff, `nleg`, `radius`, `exchange`, `kmax`). The
+engine version and recipe go into `calibration.json` and `summary.json`
+under `scattering`. The paths are handed to the fit through the same
+conversion the file reader uses, so they equal the files `native_tables.py`
+writes to the rounding of the text format (`tests/test_native_provider.py`).
+
+The default CrCoNi system still names the FEFF8L set, so earlier results
+reproduce unchanged. Those tables are **not** shipped; generating them is
+the only step that needs `xraylarch` (which bundles the FEFF8L binaries),
+and it runs in a *separate* interpreter that the main environment never
+imports:
 
 ```bash
 python feff8l_tables.py --larch-python <venv>/Scripts/python.exe \
@@ -62,10 +87,12 @@ multiple-scattering set. Both land in `data/<name>/` alongside a `meta.json`
 recording the cluster they were computed for. Point the model at them with
 `Spectrum(tables_name=..., ms_name=...)`.
 
-### Native tables (no FEFF, no larch)
+### The native engine
 
-`native_tables.py` takes the same arguments and writes the same files, from
-CHIMERA's own ab initio engine (`exafs_gpu/abinitio/`):
+`native_tables.py` takes the same arguments as `feff8l_tables.py` and
+writes the same files from CHIMERA's own ab initio engine
+(`exafs_gpu/abinitio/`), for inspection or for other codes; fits do not
+need them (`--tables native` above):
 
 ```bash
 python native_tables.py --elements Cr Co Ni --d-nn 2.517 --name crconi_fcc2517_native
@@ -190,7 +217,8 @@ chimera/
                    (white, or with a full residual covariance)
   system.py        the alloy: elements, composition, lattice, reference cell,
                    table names; the default is equiatomic fcc CrCoNi
-  multiscat.py     FEFF8L multiple-scattering paths (3- and 4-leg)
+  multiscat.py     multiple-scattering paths (3- and 4-leg), from a table
+                   directory or handed over in memory by the native engine
   multift.py       per-edge Fourier transform (each edge has its own E0)
   calibrate.py     global search for E0, k window and weight, a0, sigma^2
                    scales, bond offsets dr, C3, MS amplitude
@@ -199,9 +227,11 @@ chimera/
 exafs_gpu/
   abinitio/        native scattering engine: atom.py, potential.py,
                    selfenergy.py, phaseshift.py, sphere.py, pathsum.py,
-                   paths.py, cluster.py, tables.py; synth.py builds the
-                   blind synthetic data
-  scattering.py    scattering tables; FEFF8L reader and convention conversion
+                   paths.py, cluster.py, tables.py; provider.py computes
+                   the paths in-process for a fit ("native", cached);
+                   synth.py builds the blind synthetic data
+  scattering.py    scattering tables; feffNNNN.dat reader and the shared
+                   convention conversion
   lattice.py       supercell, neighbour lists, force constants, Warren-Cowley
   forward.py       GPU forward model and analytic adjoint
   fourier.py       k -> R transform, windows, adjoint

@@ -22,6 +22,13 @@ the elements, the nearest-neighbour spacing of the FEFF cluster and (new) the
 lattice it was built on. The reference lattice constant follows from the
 spacing and the lattice unless given.
 
+The table-set name "native" (or "native:seed=1,rpath=5.8", ...) needs no
+directory: the native engine computes the paths in-process for the system's
+own elements, composition, lattice and reference spacing
+(`exafs_gpu.abinitio.provider`), so any alloy can be fitted without FEFF:
+
+    sys = resolve("native", elements=("Fe", "Ni"), lattice="fcc", a0_ref=3.59)
+
 What is NOT general, still: every basis site must be crystallographically
 equivalent (uniform coordination) - the neighbour-list machinery and the MC
 proposal kernels assume it - which `CrystalSupercell` enforces for sc, bcc,
@@ -32,7 +39,7 @@ import os, json
 from dataclasses import dataclass, replace
 import numpy as np
 
-from exafs_gpu.scattering import Z_TABLE, ELEMENTS as _DEFAULT_ELEMENTS
+from exafs_gpu.scattering import Z_TABLE, ELEMENTS as _DEFAULT_ELEMENTS, is_native
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(_ROOT, "data")
@@ -157,7 +164,12 @@ class AlloySystem:
                     lattice=None, c_over_a=None, elements=None, system_name=None):
         """Describe an alloy from the FEFF table set `data/<name>` and its
         meta.json (elements, d_nn, lattice). `ms_name` is the matching
-        multiple-scattering set, if one was generated."""
+        multiple-scattering set, if one was generated. A native name has no
+        directory and is handed to `resolve`."""
+        if is_native(name):
+            return resolve(name, ms_name=ms_name, composition=composition, a0_ref=a0_ref,
+                           lattice=lattice, c_over_a=c_over_a, elements=elements,
+                           name=system_name)
         meta = read_meta(name)
         els = tuple(elements or meta.get("elements") or ())
         if not els:
@@ -195,6 +207,17 @@ def resolve(system=None, **overrides):
                            lattice=overrides.get("lattice") or "fcc",
                            a0_ref=overrides.get("a0_ref") or (DEFAULT.a0_ref if tuple(els) == DEFAULT.elements else None),
                            tables_name="analytic", ms_name=None,
+                           c_over_a=overrides.get("c_over_a"), name=overrides.get("name"))
+    elif is_native(system):
+        # paths computed in-process for this system: no directory, no meta.json
+        els = tuple(overrides.get("elements") or DEFAULT.elements)
+        a0 = overrides.get("a0_ref") or (DEFAULT.a0_ref if els == DEFAULT.elements else None)
+        if a0 is None:
+            raise ValueError("native tables are computed at the reference cell: pass a0_ref "
+                             "(--a0-ref) for an alloy other than the default")
+        base = AlloySystem(elements=els, composition=overrides.get("composition"),
+                           lattice=overrides.get("lattice") or "fcc", a0_ref=a0,
+                           tables_name=system, ms_name=system,
                            c_over_a=overrides.get("c_over_a"), name=overrides.get("name"))
     elif isinstance(system, str):
         base = AlloySystem.from_tables(system)

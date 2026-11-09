@@ -1,4 +1,8 @@
-"""Multiple-scattering contribution from FEFF8L paths, so the 4th shell can be fitted.
+"""Multiple-scattering contribution from FEFF8L or native paths, so the 4th shell can be fitted.
+
+The paths come from a table directory (`MSPaths(name)`, FEFF8L or
+native_tables.py output) or straight from the in-process native engine
+(`MSPaths.from_records`, the "native" table set: no files at all).
 
 Why it is needed
 ----------------
@@ -81,6 +85,18 @@ class MSPaths:
                 got.append(d)
             self.paths[a] = got
         self.n = {a: len(v) for a, v in self.paths.items()}
+
+    @classmethod
+    def from_records(cls, records, elements, d_nn, name="native", min_leg=3):
+        """Paths handed over in memory (`exafs_gpu.abinitio.provider`) instead
+        of read from a directory: `records` maps absorber -> path records."""
+        self = cls.__new__(cls)
+        self.elements = tuple(elements)
+        self.name = name
+        self.d_nn = float(d_nn)
+        self.paths = {a: [d for d in records[a] if d["nleg"] >= min_leg] for a in self.elements}
+        self.n = {a: len(v) for a, v in self.paths.items()}
+        return self
 
     def summary(self):
         out = []

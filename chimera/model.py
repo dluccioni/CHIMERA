@@ -76,7 +76,7 @@ import numpy as np
 import cupy as cp
 
 from exafs_gpu.scattering import (feff8l_tables, analytic_transition_metal_tables,
-                                  ScatteringTables, ELEMENTS, NSP)
+                                  ScatteringTables, ELEMENTS, NSP, is_native)
 from exafs_gpu.lattice import (CrystalSupercell, force_constant_matrix,
                                warren_cowley, pair_vectors)
 from . import system as SYS
@@ -89,6 +89,27 @@ from .chik import (ChiK, Window, as_kweights, kweight_value, channel_edges,
 ETOK = 0.2624682843        # k^2 [A^-2] per eV
 NKMODEL = 320
 K_LO, K_HI = 0.5, 18.0
+
+
+def native_paths(system, name):
+    """The native engine's path records for `system`, at its reference
+    spacing, with the recipe the table-set `name` spells out ("native" or
+    "native:seed=1,..."). Computed once per process and cached on disk."""
+    from exafs_gpu.abinitio import provider
+    return provider.path_records(system.elements, system.composition, system.lattice,
+                                 system.nn_ref, system.c_over_a,
+                                 recipe=provider.Recipe.parse(name))
+
+
+def scattering_provenance(system):
+    """Where a fit's scattering came from, for calibration and summary records:
+    the table-set names, and for in-process native paths the engine version,
+    recipe, reference spacing and muffin-tin summary."""
+    out = dict(tables=system.tables_name, ms=system.ms_name)
+    name = next((n for n in (system.tables_name, system.ms_name) if is_native(n)), None)
+    if name is not None:
+        out["native"] = native_paths(system, name).provenance()
+    return out
 
 
 def k_exp_axis(k_phys, dE0):
@@ -115,8 +136,10 @@ class Spectrum:
         from a calibration record, or None for equiatomic fcc CrCoNi);
         `elements`, `composition`, `lattice`, `a0_ref`, `c_over_a`,
         `tables_name` and `ms_name` override its fields. `tables` is None
-        for the FEFF8L set the system names, "analytic" for the
-        Z-parameterised stand-in (tests), or a ScatteringTables. `a0`
+        for the set the system names (a FEFF8L or native_tables.py
+        directory, or "native" for paths computed in-process with no
+        files), "analytic" for the Z-parameterised stand-in (tests), or a
+        ScatteringTables. `a0`
         defaults to the system's reference lattice constant, `dE0` (one
         value, or one per edge) to zero.
         """
@@ -160,6 +183,9 @@ class Spectrum:
             # table set "analytic" in the system (tests, dry runs)
             self.tables = analytic_transition_metal_tables(self.k_phys, s02=s02,
                                                            elements=self.elements)
+        elif is_native(self.tables_name):
+            # computed in-process by the native engine for this system; no files
+            self.tables = native_paths(self.system, self.tables_name).ss_tables(self.k_phys, s02)
         else:
             if self.tables_name is None:
                 raise ValueError(f"no FEFF tables named for {self.system.name}: pass "
@@ -173,9 +199,14 @@ class Spectrum:
                                self.shift0, sigma2=self.sigma2_ref,
                                shell=self.shell_idx)
         self.R = None
-        self.ms_paths = (multiscat.get(self.system.ms_name, elements=self.elements)
-                         .prepare(self.k_phys)
-                         if (ms and self.system.ms_name) else None)
+        self.ms_paths = None
+        if ms and is_native(self.system.ms_name):
+            npth = native_paths(self.system, self.system.ms_name)
+            self.ms_paths = multiscat.MSPaths.from_records(
+                npth.ms, self.elements, npth.d_nn, name=self.system.ms_name).prepare(self.k_phys)
+        elif ms and self.system.ms_name:
+            self.ms_paths = (multiscat.get(self.system.ms_name, elements=self.elements)
+                             .prepare(self.k_phys))
         self.chi_ms = None
         self.sigma_shell_scale = np.ones(self.nshell)
         self.set_a0(self.a0_ref if a0 is None else a0)
