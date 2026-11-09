@@ -287,9 +287,12 @@ def chi_single_scattering(edges, H, env, r_grid, k):
 # multiple scattering, exact on the snapshot geometry
 # ---------------------------------------------------------------------------
 
-def ms_templates(lattice, d_nn, rmax_eff, nleg=4):
+def ms_templates(lattice, a0, rmax_eff, nleg=4):
     """MS path templates on the ideal lattice, as lattice-offset sequences from
-    the absorber (time reverses merged; absorber-in-the-middle kept)."""
+    the absorber in units of the conventional lattice constant a0 (exact
+    multiples of 1/2 for fcc), so they transfer to any compression; time
+    reverses merged, absorber-in-the-middle kept."""
+    d_nn = a0 / CL.A0_PER_NN[lattice]
     pts = CL.lattice_cluster(d_nn, rmax_eff + 1.0, lattice)
     groups = PA.enumerate_paths(pts, np.zeros(len(pts), int), rmax_eff, nleg, group=False)
     tmpl = []
@@ -297,8 +300,8 @@ def ms_templates(lattice, d_nn, rmax_eff, nleg=4):
         if g.nleg < 3:
             continue
         seq = g.members[0]
-        tmpl.append((pts[list(seq)] / d_nn, len(g.members), [s == 0 for s in seq]))
-    return tmpl                      # offsets in units of the nearest-neighbour distance
+        tmpl.append((pts[list(seq)] / a0, len(g.members), [s == 0 for s in seq]))
+    return tmpl
 
 
 def chi_multiple_scattering(snaps, cell, species, elements, phases, templates, absorbers_per_snap,
@@ -308,12 +311,13 @@ def chi_multiple_scattering(snaps, cell, species, elements, phases, templates, a
     nsp = len(elements)
     N = cell.natoms
     # lookup: ideal offset -> atom, per absorber, through the neighbour list
-    d_nn = cell.nn_distance()
-    templates = [(o * d_nn, deg, ab) for o, deg, ab in templates]
+    a0 = cell.a0
+    templates = [(o * a0, deg, ab) for o, deg, ab in templates]
     rmax = max(np.linalg.norm(t[0], axis=1).max() for t in templates) + 0.1
     i_n, j_n, sh, off = cell.neighbour_list(rmax)
     offs = cell.ideal[j_n] + sh - cell.ideal[i_n]
-    keyof = lambda v: tuple(np.round(v * 1000).astype(np.int64))
+    # key on lattice coordinates (offset / a0), robust to rounding of a0
+    keyof = lambda v: tuple(np.round(v / a0 * 1000).astype(np.int64))
     k = None
     out = {}
     for a, el in enumerate(elements):
