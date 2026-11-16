@@ -71,8 +71,10 @@ class ForwardModel:
         self.d_shell = cp.asarray(shell)
         self.dr = np.zeros((self.nshell, self.nsp, self.nsp))
         self.c3 = np.zeros(self.nshell)
+        self.s2types = np.zeros((self.nshell, self.nsp, self.nsp))
         self.d_dr = cp.zeros(self.nshell * self.nsp * self.nsp, cp.float64)
         self.d_c3 = cp.zeros(self.nshell, cp.float64)
+        self.d_s2tab = cp.zeros(self.nshell * self.nsp * self.nsp, cp.float64)
 
         self.d_k = cp.asarray(k)
         self.d_f = cp.asarray(np.ascontiguousarray(f))
@@ -112,6 +114,22 @@ class ForwardModel:
             full[:] = dr
         self.dr = full
         self.d_dr = cp.asarray(np.ascontiguousarray(full.reshape(-1)))
+        return self
+
+    def set_sig2_types(self, s2):
+        """sigma^2 ADDED to every pair by (shell, absorber, scatterer), (nshell,
+        nsp, nsp) in A^2, or (nsp, nsp) for the first shell only: the part of
+        the disorder that depends on which species form the pair (from
+        molecular dynamics, chimera/physics.py). Zero by default."""
+        s2 = np.asarray(s2, np.float64)
+        full = np.zeros((self.nshell, self.nsp, self.nsp))
+        if s2.ndim == 2:
+            full[0] = s2
+        else:
+            n = min(self.nshell, s2.shape[0])
+            full[:n] = s2[:n]
+        self.s2types = full
+        self.d_s2tab = cp.asarray(np.ascontiguousarray(full.reshape(-1)))
         return self
 
     def set_c3(self, c3):
@@ -159,7 +177,7 @@ class ForwardModel:
         chi = cp.empty((nconf, self.nsp, self.nk), cp.float64)
         self._k_fw((self.nk, nconf), (_TPB,),
                    (r, ptype, self.d_shell, self.d_sig2, self.d_f, self.d_delta,
-                    self.d_lam, self.d_k, self.d_dr, self.d_c3, chi,
+                    self.d_lam, self.d_k, self.d_dr, self.d_c3, self.d_s2tab, chi,
                     np.int32(self.npairs), np.int32(self.nk),
                     np.int32(nconf), np.float64(self.s02)),
                    shared_mem=self.nsp * _TPB * 8)
@@ -206,7 +224,7 @@ class ForwardModel:
         gr = cp.empty((nconf, self.npairs), cp.float64)
         self._k_adj(_grid(tot), (_TPB,),
                     (r, ptype, self.d_shell, self.d_sig2, self.d_f, self.d_delta,
-                     self.d_lam, self.d_k, self.d_dr, self.d_c3, g, gr,
+                     self.d_lam, self.d_k, self.d_dr, self.d_c3, self.d_s2tab, g, gr,
                      np.int32(self.npairs), np.int32(self.nk),
                      np.int32(nconf), np.float64(self.s02)))
         gpos = cp.zeros_like(pos)
@@ -264,9 +282,10 @@ class ForwardModel:
             t = sa * self.nsp + sb
             r = np.linalg.norm(d, axis=1) + self.dr[shell, sa, sb]
             ph3 = (4.0 / 3.0) * k[None, :] ** 3 * self.c3[shell][:, None]
+            s2p = s2 + self.s2types[shell, sa, sb]
             amp = (self.s02 * f[sb] / (k[None, :] * r[:, None] ** 2)
                    * np.exp(-2 * r[:, None] / lam[None, :]
-                            - 2 * k[None, :] ** 2 * s2[:, None]))
+                            - 2 * k[None, :] ** 2 * s2p[:, None]))
             term = amp * np.sin(2 * k[None, :] * r[:, None] + delta[t] - ph3)
             for s in range(self.nsp):
                 m = sa == s          # selects PAIRS whose absorber is species s

@@ -49,11 +49,12 @@ class PotentialType:
     r_norman: float = 0.0
     r_touch: float = 0.0
     r_mt: float = 0.0
+    rel_xc: bool = False       # MacDonald-Vosko relativistic exchange (relativistic potentials)
 
     @property
     def v_gs(self):
         """Ground-state potential: Coulomb + LDA exchange-correlation."""
-        return self.v_coul + lda_xc(self.rho)[1]
+        return self.v_coul + lda_xc(self.rho, self.rel_xc)[1]
 
 
 @dataclass
@@ -107,7 +108,7 @@ def _sphavg(r_eval, R, s_grid, F):
 
 def build(positions_A, species, absorber_core_hole="1s", folp=1.15,
           mt_cap=0.97, mu=None, grid: LogGrid | None = None,
-          r_mt_override=None) -> ClusterPotential:
+          r_mt_override=None, relativistic: bool = False) -> ClusterPotential:
     """Muffin-tin potentials for a cluster.
 
     positions_A : (n, 3) Angstrom; atom 0 is the absorber (moved to the origin)
@@ -116,6 +117,9 @@ def build(positions_A, species, absorber_core_hole="1s", folp=1.15,
     mt_cap      : r_mt is kept at or below mt_cap * r_Norman
     mu          : Fermi level override (Ha); default is the electron-gas value
     r_mt_override : {label: radius in Angstrom} to impose muffin-tin radii
+    relativistic : scalar-relativistic atoms with relativistic (MacDonald-Vosko)
+                  exchange; recorded in meta, where `phaseshift` and `scf`
+                  read it to solve the scattering states the same way
     """
     pos = np.asarray(positions_A, float) / BOHR
     pos = pos - pos[0]
@@ -123,8 +127,9 @@ def build(positions_A, species, absorber_core_hole="1s", folp=1.15,
     n = len(pos)
     grid = grid or LogGrid()
     # atoms: ground state for every species, core-hole atom at the absorber
-    gs = {s: atom_for(s) for s in sorted(set(species))}
-    abs_atom = atom_for(species[0], absorber_core_hole) if absorber_core_hole else gs[species[0]]
+    gs = {s: atom_for(s, relativistic=relativistic) for s in sorted(set(species))}
+    abs_atom = (atom_for(species[0], absorber_core_hole, relativistic=relativistic)
+                if absorber_core_hole else gs[species[0]])
     tables = {s: _sphavg_tables(a) for s, a in gs.items()}
     tab_abs = _sphavg_tables(abs_atom)
 
@@ -138,7 +143,7 @@ def build(positions_A, species, absorber_core_hole="1s", folp=1.15,
     d0 = np.linalg.norm(pos, axis=1)
     types = [PotentialType(label=species[0] + ("*" if absorber_core_hole else ""),
                            symbol=species[0], Z=Z_TABLE[species[0]],
-                           core_hole=absorber_core_hole, rep=0, count=1)]
+                           core_hole=absorber_core_hole, rep=0, count=1, rel_xc=relativistic)]
     site_type = np.zeros(n, int)
     for s in sorted(set(species), key=lambda s: Z_TABLE[s]):
         idx = [i for i in range(1, n) if species[i] == s]
@@ -146,7 +151,7 @@ def build(positions_A, species, absorber_core_hole="1s", folp=1.15,
             continue
         rep = min(idx, key=lambda i: d0[i])
         types.append(PotentialType(label=s, symbol=s, Z=Z_TABLE[s], core_hole=None,
-                                   rep=rep, count=len(idx)))
+                                   rep=rep, count=len(idx), rel_xc=relativistic))
         site_type[idx] = len(types) - 1
 
     # radial grid for the overlapped potentials: up to 2x the nearest spacing
@@ -214,9 +219,10 @@ def build(positions_A, species, absorber_core_hole="1s", folp=1.15,
     kf = (3.0 * np.pi ** 2 * rho_int) ** (1.0 / 3.0)
     # electron-gas Fermi level, written so that the interstitial momentum of an
     # electron at mu is exactly kF: Coulomb level + v_xc(rho_int) + kF^2/2
-    mu_eg = v_int_coul + float(lda_xc(rho_int)[1]) + 0.5 * kf ** 2
+    mu_eg = v_int_coul + float(lda_xc(rho_int, relativistic)[1]) + 0.5 * kf ** 2
     cp = ClusterPotential(positions=pos, species=species, types=types,
                           site_type=site_type, v_int=v_int, v_int_coul=v_int_coul,
                           rho_int=rho_int, mu=mu if mu is not None else mu_eg,
-                          folp=folp, meta=dict(mu_electron_gas=mu_eg, mt_cap=mt_cap))
+                          folp=folp, meta=dict(mu_electron_gas=mu_eg, mt_cap=mt_cap,
+                                               relativistic=bool(relativistic)))
     return cp

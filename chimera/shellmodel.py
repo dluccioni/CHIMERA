@@ -141,15 +141,59 @@ class ShellModel:
                       c4=np.zeros(self.nshell),
                       sigma_pair=np.ones((self.nsp, self.nsp)),
                       ms_amp_edge=np.ones(self.nsp))
+        self.phys = None                        # see set_physics
+        self._phys_ver = 0
         self._B = self._ms = self._ft = None
         self._B_key = self._ms_key = self._ft_key = None
+
+    def set_physics(self, sigma2=None, dr=None, c3=None):
+        """Disorder by shell AND pair type from a physical model
+        (`chimera.physics.pair_statistics`) in place of the fitted per-shell
+        values. Each argument is (nshell, nsp, nsp) or None; `None` everywhere
+        switches the physical model off.
+
+          sigma2  the variance of each pair type's distance. A pair's variance
+                  becomes sigma_scale * sigma2[s, a, b] * sigma_shell_scale[s]
+                  (* sigma_pair[a, b] in the first shell), so sigma_scale = 1
+                  with the multipliers at 1 is the physical model as it stands,
+                  and every fitted multiplier is still available as a nested
+                  correction on top of it.
+          dr      each pair type's mean distance minus the LATTICE shell
+                  radius, added to r_s(a0) (and to the fitted first-shell dr).
+                  Measured from the lattice rather than from the shell average,
+                  so a0 keeps its crystallographic meaning: the mean distance
+                  of a shell exceeds its lattice radius by the vibration
+                  perpendicular to the bond, and the size mismatch moves each
+                  pair type off it, and both are now in dr instead of in a0.
+          c3      the third cumulant per shell and pair type, added to the
+                  fitted per-shell c3.
+        """
+        tabs = {}
+        for name, v in (("sigma2", sigma2), ("dr", dr), ("c3", c3)):
+            if v is not None:
+                v = np.asarray(v, float)
+                full = np.zeros((self.nshell, self.nsp, self.nsp))
+                n = min(self.nshell, v.shape[0])
+                full[:n] = v[:n]
+                if name == "sigma2" and n < self.nshell:
+                    # shells beyond the physical model's keep the reference value
+                    full[n:] = self.sigma2_shell_ref[n:, None, None]
+                tabs[name] = full
+        self.phys = tabs or None
+        self._phys_ver += 1
+        self._B_key = None
+        return self
 
     # ---------------------------------------------------------- construction
     @classmethod
     def from_spectrum(cls, S):
         sysm = getattr(S, "system", None)
+        # with a path library attached the pair-count model takes its exact
+        # random-alloy expectation, not the composition-averaged term
+        lib = getattr(S, "ms_library", None)
+        ms_paths = lib.lib if lib is not None else S.ms_paths
         m = cls(S.k_phys, S.tables, S.shells_ref, S.shell_mult, S.sigma2_shell_ref,
-                S.cell.natoms, a0_ref=S.a0_ref, ms_paths=S.ms_paths, s02=S.s02,
+                S.cell.natoms, a0_ref=S.a0_ref, ms_paths=ms_paths, s02=S.s02,
                 dk_win=S.dk_win, pairs=(S.i, S.j, S.shell_idx),
                 composition=(sysm.composition if sysm is not None else None),
                 elements=getattr(S, "elements", None), system=sysm)
@@ -232,6 +276,16 @@ class ShellModel:
     def sigma2_shell(self):
         return self.sigma2_shell_ref * self.p["sigma_scale"] * self.p["sigma_shell_scale"]
 
+    def sigma2_nn(self):
+        """The first-shell variance, composition-averaged over pair types when
+        the physical model sets it (what the multiple-scattering term uses)."""
+        ph = self.phys or {}
+        if ph.get("sigma2") is None:
+            return float(self.sigma2_shell()[0])
+        c = np.asarray(self.composition)
+        return float((ph["sigma2"][0] * np.outer(c, c)).sum()
+                     * self.p["sigma_scale"] * self.p["sigma_shell_scale"][0])
+
     # -------------------------------------------------------------- pieces
     def basis(self):
         """B[a, b, s](k), the chi(k) one (absorber a, scatterer b, shell s) pair
@@ -252,21 +306,28 @@ class ShellModel:
         p = self.p
         key = (p["a0"], p["sigma_scale"], p["sigma_shell_scale"].tobytes(),
                p["dr"].tobytes(), p["c3"].tobytes(), p["c4"].tobytes(),
-               p["sigma_pair"].tobytes())
+               p["sigma_pair"].tobytes(), self._phys_ver)
         if self._B_key != key:
             k = self.k
             r_s, s2 = self.radii(), self.sigma2_shell()
+            ph = self.phys or {}
+            s2t, drt, c3t = ph.get("sigma2"), ph.get("dr"), ph.get("c3")
             B = np.zeros((self.nsp, self.nsp, self.nshell, k.size))
             k2, k3, k4 = k ** 2, k ** 3, k ** 4
             for s in range(self.nshell):
-                ph3 = (4.0 / 3.0) * k3 * p["c3"][s]
                 amp4 = (2.0 / 3.0) * k4 * p["c4"][s]
                 for a in range(self.nsp):
                     for b in range(self.nsp):
                         r = r_s[s] + (p["dr"][a, b] if s == 0 else 0.0)
+                        if drt is not None:
+                            r = r + drt[s, a, b]
                         # the pair-type width applies where the pair types are
                         # resolved at all, which is the first shell
-                        s2ab = s2[s] * (p["sigma_pair"][a, b] if s == 0 else 1.0)
+                        base = (s2[s] if s2t is None else
+                                s2t[s, a, b] * p["sigma_scale"] * p["sigma_shell_scale"][s])
+                        s2ab = base * (p["sigma_pair"][a, b] if s == 0 else 1.0)
+                        c3ab = p["c3"][s] + (c3t[s, a, b] if c3t is not None else 0.0)
+                        ph3 = (4.0 / 3.0) * k3 * c3ab
                         B[a, b, s] = (self.s02 * self.f[b] / (k * r * r)
                                       * np.exp(-2.0 * r / self.lam
                                                - 2.0 * k2 * s2ab + amp4)
@@ -279,7 +340,7 @@ class ShellModel:
             return 0.0
         p = self.p
         r_nn = float(self.radii()[0])
-        s2nn = float(self.sigma2_shell()[0])
+        s2nn = self.sigma2_nn()
         key = (r_nn, s2nn, p["ms_amp"], p["ms_c"], p["ms_amp_edge"].tobytes())
         if self._ms_key != key:
             ms = self.ms_paths.chi_fast(

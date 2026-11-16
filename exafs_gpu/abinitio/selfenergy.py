@@ -337,7 +337,7 @@ def sigma_hl(rs, k, quinn=False):
     return re + 1j * im
 
 
-def local_sigma(rho, e_rel, model="hl", quinn=False):
+def local_sigma(rho, e_rel, model="hl", quinn=False, relativistic=False):
     """Exchange-correlation potential for a photoelectron e_rel = E - mu above
     the Fermi level, at local density rho (arrays broadcast). Hartree.
 
@@ -347,11 +347,13 @@ def local_sigma(rho, e_rel, model="hl", quinn=False):
                  keep their meaning)
           'dh' : Dirac-Hara exchange, Sigma_x(p) - Sigma_x(kF) + v_xc^LDA, real
           'gs' : the ground-state LDA potential, energy independent, real
+    relativistic: the ground-state part is the relativistic (MacDonald-Vosko)
+                 LDA potential, as in the relativistic atoms
     """
     rho = np.maximum(np.asarray(rho, float), 1e-12)
     rs = (3.0 / (4.0 * np.pi * rho)) ** (1.0 / 3.0)
     kf = kf_of(rs)
-    vxc = lda_xc(rho)[1]
+    vxc = lda_xc(rho, relativistic)[1]
     p = np.sqrt(kf * kf + 2.0 * np.maximum(np.asarray(e_rel, float), 0.0))
     if model == "gs":
         return vxc + 0j * p

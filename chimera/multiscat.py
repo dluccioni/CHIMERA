@@ -168,10 +168,19 @@ class MSPaths:
 _CACHE = {}
 
 
-def get(name="crconi_fcc2517_ms", **kw):
+def get(name="crconi_fcc2517_ms", composition=None, **kw):
+    """The multiple-scattering paths of table set `name`. A path LIBRARY
+    (chimera/mslibrary.py, a directory with library.json) gives the exact
+    random-alloy expectation at `composition` instead of one cluster's
+    average, through the same interface."""
     if "elements" in kw and kw["elements"] is not None:
         kw["elements"] = tuple(kw["elements"])
-    key = (name, tuple(sorted(kw.items())))
+    comp = None if composition is None else tuple(float(x) for x in composition)
+    key = (name, comp, tuple(sorted(kw.items())))
     if key not in _CACHE:
-        _CACHE[key] = MSPaths(name, **kw)
+        if os.path.exists(os.path.join(tables_root(name), "library.json")):
+            from .mslibrary import PathLibrary
+            _CACHE[key] = PathLibrary(name, composition=comp)
+        else:
+            _CACHE[key] = MSPaths(name, **kw)
     return _CACHE[key]

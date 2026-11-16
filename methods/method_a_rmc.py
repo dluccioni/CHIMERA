@@ -67,7 +67,16 @@ class RMCSampler:
                  swap_frac=0.75, disp_sigma=0.015, max_disp=0.30,
                  nsp=None, collect_after=None, collect_every=25,
                  adapt_every=0, target_accept=0.35, profile_scale=True,
-                 collect_beta=0.5, n_collect=4):
+                 collect_beta=0.5, n_collect=4, energy_prior=None, ms_library=None):
+        """`energy_prior`: (V, T) - effective pair interactions V (nshell, nsp,
+        nsp) in eV per unordered pair (chimera/physics.py) and the annealing
+        temperature T (K). Every move is then weighted by exp(-dE/kT) as well
+        as by the likelihood: the posterior is the data times the Boltzmann
+        prior of the alloy's own energetics. The prior is not tempered, so it
+        cancels in replica exchange.
+        `ms_library`: a chimera.mslibrary.SupercellMS - multiple scattering
+        computed from the configuration's own species along every 3- and
+        4-leg path, instead of the composition-averaged term."""
         # NOTE on the ladder: acceptance is exp(-beta*dChi2*nfit) with nfit ~ 400,
         # so the effective scale is beta*nfit. The original tmin=0.35 left the
         # coldest replica accepting moves that worsened chi^2 by ~1e-3, which in
@@ -136,6 +145,18 @@ class RMCSampler:
 
         self.seed = int(seed)
         n = self.nsp
+        # Boltzmann prior: V/2 per DIRECTED pair, by (fm shell, pair type)
+        self.energy_beta = 0.0
+        self._etab = None
+        if energy_prior is not None:
+            V, T_ann = energy_prior
+            V = np.asarray(V, float)
+            tab = np.zeros((fm.nshell, n * n))
+            m = min(fm.nshell, V.shape[0])
+            tab[:m] = 0.5 * V[:m].reshape(m, n * n)
+            self._etab = cp.asarray(tab.reshape(-1))
+            self.energy_beta = 1.0 / (8.617333262e-5 * float(T_ann))
+        self.ms = ms_library
         self._k_delta = kernels.get("chi_delta", n)
         self._k_commit = kernels.get("commit_move", n)
         self._k_sel = kernels.get("propose_select", n)
@@ -152,6 +173,8 @@ class RMCSampler:
         self.ptype = self.fm.ptypes(self.species)
         self.chi = self.fm.chi(self.pos, self.species, r=self.r, ptype=self.ptype,
                                normalise=False)
+        if self.ms is not None:
+            self.chi = self.chi + self.ms.init(self.species)
         self.count = cp.zeros((n, self.nsp), cp.float64)
         for s in range(self.nsp):
             self.count[:, s] = (self.species == s).sum(axis=1)
@@ -247,16 +270,23 @@ class RMCSampler:
                        self._rnew, self._ptnew,
                        self.fm.d_sig2, self.fm.d_f, self.fm.d_delta,
                        self.fm.d_lam, self.fm.d_k, self.fm.d_dr, self.fm.d_c3,
-                       self._dchi,
+                       self.fm.d_s2tab, self._dchi,
                        np.int32(self.npairs), np.int32(self.nk),
                        np.int32(n), np.int32(m), np.float64(self.fm.s02)),
                       shared_mem=self.nsp * _TPB * 8)
+        if self.ms is not None:
+            self._dchi += self.ms.delta(self.species, self._a, self._b, self._nsa, self._nsb)
         trial = self.chi + self._dchi
         c2 = self._chi2(trial)
         dE = c2 - self.chi2
+        x = self.beta * dE * self.nfit
+        if self._etab is not None:
+            x = x + self.energy_beta * self.energy_delta()
         u = self.cp_rng.random(n)
-        acc = (dE <= 0) | (u < cp.exp(-cp.minimum(self.beta * dE * self.nfit, 60.0)))
+        acc = (x <= 0) | (u < cp.exp(-cp.minimum(x, 60.0)))
         accb = acc.astype(cp.uint8)
+        if self.ms is not None:
+            self.ms.commit(acc)
 
         self._k_commit(_grid(m * n), (_TPB,),
                        (self._aff, self._rnew, self._ptnew, accb,
@@ -277,6 +307,24 @@ class RMCSampler:
         self.best_sp = cp.where(imp[:, None], self.species, self.best_sp)
         self.best_pos = cp.where(imp[:, None, None], self.pos, self.best_pos)
         return acc
+
+    def energy_delta(self):
+        """Energy change (eV) of every replica's proposed move under the pair
+        interactions: the affected directed pairs, old type -> new type."""
+        aff = self._aff
+        valid = aff >= 0
+        affc = cp.maximum(aff, 0)
+        nn = self.nsp * self.nsp
+        sh = self.fm.d_shell[affc]
+        pold = cp.take_along_axis(self.ptype, affc, axis=1)
+        d = self._etab[sh * nn + self._ptnew] - self._etab[sh * nn + pold]
+        return (d * valid).sum(axis=1)
+
+    def energy(self, species=None):
+        """Pair-interaction energy (eV) of every replica's configuration."""
+        pt = self.ptype if species is None else self.fm.ptypes(cp.asarray(species))
+        nn = self.nsp * self.nsp
+        return self._etab[self.fm.d_shell[None, :] * nn + pt].sum(axis=1)
 
     def _refresh_counts(self):
         for s in range(self.nsp):
@@ -313,6 +361,8 @@ class RMCSampler:
             self.pos = self.pos[ix]; self.species = self.species[ix]
             self.r = self.r[ix]; self.ptype = self.ptype[ix]
             self.count = self.count[ix]
+            if self.ms is not None:
+                self.ms.permute(ix)
             self.best_chi2 = self.best_chi2[ix]
             self.best_sp = self.best_sp[ix]; self.best_pos = self.best_pos[ix]
         if return_rates:
@@ -391,6 +441,8 @@ class RMCSampler:
         bsp, bpos, bc2 = self.best()
         chk = self.fm.chi(cp.asarray(bpos[None]),
                           cp.asarray(bsp[None].astype(np.int32)), normalise=False)
+        if self.ms is not None:
+            chk = chk + self.ms.full(cp.asarray(bsp[None].astype(np.int32)))
         cnt = cp.zeros((1, self.nsp), cp.float64)
         for s_ in range(self.nsp):
             cnt[:, s_] = (cp.asarray(bsp[None].astype(np.int32)) == s_).sum(axis=1)

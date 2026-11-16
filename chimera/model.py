@@ -238,7 +238,8 @@ class Spectrum:
             self.ms_paths = multiscat.MSPaths.from_records(
                 npth.ms, self.elements, npth.d_nn, name=self.system.ms_name).prepare(self.k_phys)
         elif ms and self.system.ms_name:
-            self.ms_paths = (multiscat.get(self.system.ms_name, elements=self.elements)
+            self.ms_paths = (multiscat.get(self.system.ms_name, elements=self.elements,
+                                           composition=self.system.composition)
                              .prepare(self.k_phys))
         self.chi_ms = None
         self.sigma_shell_scale = np.ones(self.nshell)
@@ -260,7 +261,7 @@ class Spectrum:
         self.shells = self.shells_ref * s
         self.fm.d_shift = cp.asarray(np.ascontiguousarray(self.shift, np.float64))
         self._pos = cp.asarray(self.cell.ideal[None])
-        if getattr(self, "ms_paths", None) is not None and self.chi_ms is not None:
+        if self._ms_on():
             self.set_ms()
         return self
 
@@ -274,7 +275,7 @@ class Spectrum:
         self.sigma2 = (self.sigma2_ref * self.sigma_scale
                        * self.sigma_shell_scale[self.shell_idx])
         self.fm.d_sig2 = cp.asarray(np.ascontiguousarray(self.sigma2, np.float64))
-        if getattr(self, "ms_paths", None) is not None and self.chi_ms is not None:
+        if self._ms_on():
             self.set_ms(self.ms_amp, self.ms_c)
         return self
 
@@ -295,11 +296,20 @@ class Spectrum:
         return self
 
     def set_ms(self, amp=None, c_ms=None):
-        """Rebuild the composition-averaged multiple-scattering chi(k)."""
+        """Rebuild the composition-averaged multiple-scattering chi(k), or,
+        with a path library attached, the library's table at the current
+        lattice and sigma^2."""
         if amp is not None:
             self.ms_amp = float(amp)
         if c_ms is not None:
             self.ms_c = float(c_ms)
+        lib = getattr(self, "ms_library", None)
+        if lib is not None:
+            self.chi_ms = None
+            lib.set_params(sigma2_nn=self.sigma2_nn(), r_nn=float(self.shells[0]),
+                           c_ms=self.ms_c, amp=self.ms_amp, s02=self.s02,
+                           a_scale=float(self.shells[0]) / lib.lib.d_nn)
+            return self
         if self.ms_paths is None:
             self.chi_ms = None
             return self
@@ -308,6 +318,27 @@ class Spectrum:
             c_ms=self.ms_c, amp=self.ms_amp, s02=self.s02,
             a_scale=float(self.shells[0]) / self.ms_paths.d_nn)
         return self
+
+    def attach_ms_library(self, library):
+        """Exact multiple scattering: a `chimera.mslibrary.PathLibrary` (or
+        its name) summed over each configuration's own paths, in place of the
+        composition-averaged term. Every chi this Spectrum computes - and the
+        sampler, through `fit_one` - then carries it. `None` detaches."""
+        from . import mslibrary
+        if library is None:
+            self.ms_library = None
+            return self.set_ms()
+        if isinstance(library, str):
+            library = mslibrary.PathLibrary(library, composition=self.system.composition)
+        library.prepare(self.k_phys)
+        self.ms_library = mslibrary.SupercellMS(library, self)
+        if self.ms_paths is None:
+            self.ms_paths = library               # the MS term is on
+        return self.set_ms()
+
+    def _ms_on(self):
+        return getattr(self, "ms_paths", None) is not None and (
+            self.chi_ms is not None or getattr(self, "ms_library", None) is not None)
 
     def sigma2_nn(self):
         d = np.linalg.norm((self.cell.ideal[self.j] + self.shift)
@@ -393,6 +424,10 @@ class Spectrum:
         chi = self.fm.chi(p, sp)          # (1, nsp, nk), indexed by absorber
         if self.chi_ms is not None:
             chi = chi + cp.asarray(self.chi_ms)[None]
+        lib = getattr(self, "ms_library", None)
+        if lib is not None:
+            cnt = cp.stack([(sp == s).sum(axis=1) for s in range(self.nsp)], axis=1)
+            chi = chi + lib.full(sp) / cp.maximum(cnt, 1)[:, :, None]
         return chi
 
     def chi_k(self, species, pos=None):

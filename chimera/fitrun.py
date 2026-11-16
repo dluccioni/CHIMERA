@@ -223,8 +223,22 @@ def fit_one(S, R_data, data, idx, mask_d, a0_guess, sig_guess, seeds=(0, 1),
             nsteps=6000, nrep=48, refine=True, collect=True,
             free_a0=True, free_sigma=True, swap_frac=1.0, max_disp=0.10,
             disp_sigma=0.012, eval_mask=None, crlb=True, profile_scale=True,
-            collect_beta=0.5, noise=None, joint=False, free_dE0=False):
+            collect_beta=0.5, noise=None, joint=False, free_dE0=False,
+            energy_prior=None, ms_library=None, n_alpha_shells=3):
     """Refine the lattice, then sample configurations. Returns a result dict.
+
+    `energy_prior`  (V, T): weigh every move by the Boltzmann factor of the
+                    alloy's pair interactions V (nshell, nsp, nsp; eV per
+                    unordered pair, chimera/physics.py) at the temperature T
+                    (K) the sample was last equilibrated at, on top of the
+                    likelihood. The posterior samples then come from data x
+                    prior; the cold rungs, which find the best-fit
+                    configuration, are dominated by the data.
+    `ms_library`    chimera.mslibrary.SupercellMS: multiple scattering from
+                    the configuration's own species along every 3- and 4-leg
+                    path, in place of the composition-averaged term
+    `n_alpha_shells` shells whose Warren-Cowley parameters are reported
+                    (`wc_shells*`; `wc` stays the first shell)
 
     `crlb`          also compute the Cramer-Rao bounds on the shell-1 alphas
     `profile_scale` profile the per-edge amplitude inside the sampler's chi^2
@@ -281,9 +295,17 @@ def fit_one(S, R_data, data, idx, mask_d, a0_guess, sig_guess, seeds=(0, 1),
                   target=target, mask=mask, sigR=sigR,
                   ft=MultiEdgeFT.from_spectrum(S))
 
+    nsh_a = max(1, min(int(n_alpha_shells), len(S.shells)))
+
+    def wc_all(sp):
+        """(n_alpha_shells, npairs) Warren-Cowley parameters, triu order."""
+        sp = np.asarray(sp, np.int32)
+        return np.array([warren_cowley(sp, S.i, S.j, S.shift, S.cell, float(S.shells[s]),
+                                       nsp=S.nsp)[np.triu_indices(S.nsp)]
+                         for s in range(nsh_a)])
+
     def wc_of(sp):
-        return warren_cowley(np.asarray(sp, np.int32), S.i, S.j, S.shift, S.cell,
-                             float(S.shells[0]), nsp=S.nsp)[np.triu_indices(S.nsp)]
+        return wc_all(sp)[0]
 
     def sample(n, start=None, keep_samples=True):
         """One pass over the seeds at the current nuisances. `start` warm-starts
@@ -296,7 +318,9 @@ def fit_one(S, R_data, data, idx, mask_d, a0_guess, sig_guess, seeds=(0, 1),
                              collect_after=(int(n * 0.6) if (collect and keep_samples)
                                             else None),
                              collect_every=50, profile_scale=profile_scale,
-                             collect_beta=collect_beta)
+                             collect_beta=collect_beta, energy_prior=energy_prior,
+                             ms_library=(ms_library if ms_library is not None
+                                         else getattr(S, "ms_library", None)))
             if start is None:
                 smp.init_state(S.random_config(int(s)), S.cell.ideal)
             else:
@@ -307,11 +331,11 @@ def fit_one(S, R_data, data, idx, mask_d, a0_guess, sig_guess, seeds=(0, 1),
             smp.run(n, log_every=10 ** 9)
             xrate.append(float(np.nanmean(smp.exchange_rate)))
             spb, posb, c2 = smp.best()
-            W.append(wc_of(spb))
+            W.append(wc_all(spb))
             chi2s.append(float(c2))
             if collect and keep_samples:
                 for sample_, _c2 in smp.samples:      # samples are (species, chi2)
-                    post.append(wc_of(sample_))
+                    post.append(wc_all(sample_))
             if best is None or c2 < best[1]:
                 best = (spb.copy(), c2, posb.copy())
         return W, chi2s, best, post, xrate, c20
@@ -331,7 +355,10 @@ def fit_one(S, R_data, data, idx, mask_d, a0_guess, sig_guess, seeds=(0, 1),
     W, chi2s, best, post, xrate, chi2_0 = sample(nsteps)
     tgt, cplx, m0, scales, sig_data = (st["tgt"], st["cplx"], st["m0"], st["scales"],
                                        st["sig_data"])
-    W = np.array(W)
+    W_all = np.array(W)                         # (seeds, shells, pairs)
+    post_all = np.array(post) if post else None
+    W = W_all[:, 0]
+    post = [p[0] for p in post] if post else []
     spb, posb = best[0], best[2]
     rms_disp = float(np.sqrt(((posb - S.cell.ideal) ** 2).sum(1).mean()))
     model_R = M.observe(S, spb, tgt, pos=posb)[:, idx]
@@ -373,6 +400,11 @@ def fit_one(S, R_data, data, idx, mask_d, a0_guess, sig_guess, seeds=(0, 1),
         wc=W.mean(0).tolist(), wc_sd_seeds=W.std(0).tolist(),
         wc_posterior_sd=(np.std(post, axis=0).tolist() if post else None),
         wc_posterior_mean=(np.mean(post, axis=0).tolist() if post else None),
+        wc_shells=W_all.mean(0).tolist(),
+        wc_shells_posterior_mean=(post_all.mean(0).tolist() if post_all is not None else None),
+        wc_shells_posterior_sd=(post_all.std(0).tolist() if post_all is not None else None),
+        energy_prior_T=(float(energy_prior[1]) if energy_prior is not None else None),
+        ms_library=ms_library is not None,
         posterior_beta=collect_beta, exchange_rate=xrate,
         sigma_model=sig_data.tolist(),
         species=spb.astype(np.int8).tolist(),

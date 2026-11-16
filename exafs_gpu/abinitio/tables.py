@@ -34,6 +34,7 @@ from . import paths as PA
 from . import pathsum as PSM
 from . import phaseshift as PS
 from . import potential as PO
+from . import scf as SCF
 from .potential import BOHR, HARTREE
 from .selfenergy import GAMMA_K
 
@@ -64,8 +65,12 @@ def chi_of_columns(cols, reff_A):
 
 def _write_feffdat(fn, title, cpot, group: PA.PathGroup, cols, symbols, gamma_ev, model):
     ty = cpot.types
+    kind = (f"SCF {cpot.meta.get('r_scf_A', 0):.2f} A (cluster Green's function)"
+            if cpot.meta.get("scf") else "non-SCF overlapped atoms")
+    if cpot.meta.get("relativistic"):
+        kind += ", scalar-relativistic"
     lines = [f" {title}    CHIMERA native (EXAFS)",
-             f" POT  non-SCF overlapped atoms, core-hole, folp {cpot.folp:.3f}, exchange {model}"]
+             f" POT  {kind}, core-hole, folp {cpot.folp:.3f}, exchange {model}"]
     lines.append(f" Abs   Z={ty[0].Z:2d} Rmt={ty[0].r_mt * BOHR:6.3f} Rnm={ty[0].r_norman * BOHR:6.3f} K  shell")
     for i, t in enumerate(ty[1:], 1):
         lines.append(f" Pot {i} Z={t.Z:2d} Rmt={t.r_mt * BOHR:6.3f} Rnm={t.r_norman * BOHR:6.3f}")
@@ -92,14 +97,18 @@ def _write_feffdat(fn, title, cpot, group: PA.PathGroup, cols, symbols, gamma_ev
 
 def build_absorber(absorber, elements, d_nn, lattice="fcc", composition=None, radius=6.5,
                    rpath=None, nleg=2, seed=0, k_grid=None, gamma_ev=None, model="hl",
-                   c_over_a=None, precision="double", verbose=True):
-    """Potentials, phase shifts, paths and their amplitudes for one absorber."""
+                   c_over_a=None, precision="double", verbose=True, scf=False, rel=False,
+                   mpse=None, quinn=False):
+    """Potentials, phase shifts, paths and their amplitudes for one absorber.
+    rel: scalar-relativistic; mpse: `losses.Poles` of the material (many-pole
+    self-energy); quinn: Quinn's low-energy loss with the HL self-energy."""
     t0 = time.time()
     pts = CL.lattice_cluster(d_nn, radius, lattice, c_over_a)
     species = CL.alloy_species(pts, absorber, list(elements), d_nn, composition, seed)
-    cpot = PO.build(pts, species)
+    cpot = (SCF.build(pts, species, verbose=verbose, relativistic=rel).potential if scf
+            else PO.build(pts, species, relativistic=rel))
     gam = GAMMA_K.get(absorber, 1.0) if gamma_ev is None else gamma_ev
-    ph = PS.phase_shifts(cpot, k_grid, gamma_ev=gam, model=model)
+    ph = PS.phase_shifts(cpot, k_grid, gamma_ev=gam, model=model, quinn=quinn, mpse=mpse)
     sym_type = {t.symbol: i for i, t in enumerate(cpot.types) if i > 0}
     site_types = np.array([0] + [sym_type[s] for s in species[1:]])
     rp = rpath if rpath is not None else d_nn + 0.2
@@ -115,7 +124,8 @@ def build_absorber(absorber, elements, d_nn, lattice="fcc", composition=None, ra
 
 def build_set(name, elements, d_nn, lattice="fcc", composition=None, radius=6.5,
               rpath=None, nleg=2, seed=0, k_grid=None, gamma_ev=None, model="hl",
-              c_over_a=None, out_root=None, library=False):
+              c_over_a=None, out_root=None, library=False, scf=False, rel=False,
+              sigma="hl", quinn=False):
     """Write data/<name>/<absorber>/feffNNNN.dat, paths.dat and meta.json."""
     elements = list(elements)
     comp = (np.ones(len(elements)) / len(elements) if composition is None
@@ -123,9 +133,14 @@ def build_set(name, elements, d_nn, lattice="fcc", composition=None, radius=6.5,
     comp = comp / comp.sum()
     root = out_root or os.path.join(DATA_DIR, name)
     os.makedirs(root, exist_ok=True)
+    mp = None
+    if sigma == "mpse":
+        from . import losses as LS
+        mp = LS.material_poles(elements, comp, lattice, d_nn, c_over_a)
     for a in elements:
         res = build_absorber(a, elements, d_nn, lattice, comp, radius, rpath, nleg, seed,
-                             k_grid, None if gamma_ev is None else gamma_ev.get(a), model, c_over_a)
+                             k_grid, None if gamma_ev is None else gamma_ev.get(a), model, c_over_a,
+                             scf=scf, rel=rel, mpse=mp, quinn=quinn)
         d = os.path.join(root, a)
         os.makedirs(d, exist_ok=True)
         for fn in os.listdir(d):
@@ -136,7 +151,8 @@ def build_set(name, elements, d_nn, lattice="fcc", composition=None, radius=6.5,
         for i, g in enumerate(res["groups"]):
             cols = feff_columns(res["trace"][i], res["ph"], g.reff_A)
             _write_feffdat(os.path.join(d, f"feff{i + 1:04d}.dat"), title, res["cpot"], g, cols,
-                           res["species"], res["gamma_ev"], model)
+                           res["species"], res["gamma_ev"],
+                           model + ("+many-pole" if mp is not None else "") + ("+Quinn" if quinn else ""))
             plines.append(f"  {i + 1:4d}  {g.nleg:2d}  {g.degeneracy:7.3f}  index, nleg, degeneracy, r= {g.reff_A:8.4f}")
         with open(os.path.join(d, "paths.dat"), "w") as f:
             f.write("\n".join(plines) + "\n")
@@ -146,7 +162,8 @@ def build_set(name, elements, d_nn, lattice="fcc", composition=None, radius=6.5,
                 f.write(f"{s} {p[0]:.5f} {p[1]:.5f} {p[2]:.5f}\n")
     meta = dict(elements=elements, composition=comp.tolist(), lattice=lattice,
                 c_over_a=c_over_a, d_nn=d_nn, radius=radius, rpath=rpath, nleg=nleg,
-                engine="chimera-native", exchange=model, seed=seed)
+                engine="chimera-native", exchange=model, seed=seed, scf=bool(scf),
+                relativistic=bool(rel), sigma=sigma, quinn=bool(quinn))
     with open(os.path.join(root, "meta.json"), "w") as f:
         json.dump(meta, f, indent=1)
     return root
@@ -167,11 +184,22 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--exchange", default="hl", choices=["hl", "dh", "gs"])
     ap.add_argument("--kmax", type=float, default=20.0)
+    ap.add_argument("--scf", action="store_true",
+                    help="self-consistent potentials (cluster Green's function) instead of "
+                         "overlapped free atoms")
+    ap.add_argument("--rel", action="store_true",
+                    help="scalar-relativistic atoms, potentials and scattering states")
+    ap.add_argument("--sigma", default="hl", choices=["hl", "mpse"],
+                    help="self-energy: Hedin-Lundqvist, or the many-pole model of the measured "
+                         "loss function")
+    ap.add_argument("--quinn", action="store_true",
+                    help="Quinn's electron-hole loss below the plasmon (HL only)")
     args = ap.parse_args(argv)
     t = time.time()
     root = build_set(args.name, args.elements, args.d_nn, args.lattice, args.composition,
                      args.radius, args.rpath, args.nleg, args.seed,
-                     PS.default_k_grid(args.kmax), None, args.exchange, args.c_over_a)
+                     PS.default_k_grid(args.kmax), None, args.exchange, args.c_over_a,
+                     scf=args.scf, rel=args.rel, sigma=args.sigma, quinn=args.quinn)
     print(f"wrote {root} in {time.time() - t:.1f}s")
 
 

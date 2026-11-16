@@ -23,6 +23,7 @@ env/
 # intermediate .pad/.json/.dat per absorber and are not worth keeping.
 results/feff8l_runs/
 results/feff8l_ms/
+results/feff8l_foils/
 **/feff.pad
 **/phase.pad
 **/pot.pad

@@ -23,6 +23,12 @@ ENGINE_VERSION whenever a change to the engine moves the numbers.
     recs = path_records(("Cr", "Co", "Ni"), (1/3, 1/3, 1/3), "fcc", 2.5215)
     tables = recs.ss_tables(k_grid, s02=1.0)
     ms = recs.ms["Cr"]                      # path records, 3+ legs
+
+The physics is chosen in the recipe; the defaults are the original engine
+(overlapped non-relativistic atoms, Hedin-Lundqvist self-energy). The most
+complete set is "native:rel=1,scf=1,sigma=mpse": scalar-relativistic atoms
+and scattering states, self-consistent potentials, and the many-pole
+self-energy of the alloy's measured loss function (losses.py).
 """
 from __future__ import annotations
 
@@ -40,6 +46,7 @@ from . import paths as PA
 from . import pathsum as PSM
 from . import phaseshift as PS
 from . import potential as PO
+from . import scf as SCF
 from .atom import _cache_dir
 from .potential import BOHR, HARTREE
 from .selfenergy import GAMMA_K
@@ -60,6 +67,10 @@ class Recipe:
     seed: int = 0            # which random alloy cluster sets the species around each absorber
     exchange: str = "hl"     # self-energy: Hedin-Lundqvist ("dh", "gs" also built)
     kmax: float = 20.0       # top of the tabulated momentum grid (A^-1)
+    scf: int = 0             # 1: self-consistent potentials (scf.py); 0: overlapped atoms
+    rel: int = 0             # 1: scalar-relativistic atoms, potentials and scattering states
+    sigma: str = "hl"        # "mpse": many-pole self-energy from the measured loss function (losses.py)
+    quinn: int = 0           # 1: Quinn's electron-hole loss below the plasmon (HL only)
 
     @classmethod
     def parse(cls, name):
@@ -161,12 +172,29 @@ def _key(elements, comp, lattice, d_nn, c_over_a, recipe):
 def _compute(elements, comp, lattice, d_nn, c_over_a, recipe, verbose):
     k_grid = PS.default_k_grid(recipe.kmax)
     ss, ms, pot = {}, {}, {}
+    rel = bool(recipe.rel)
+    mp = None
+    if recipe.sigma == "mpse":
+        from . import losses as LS
+        mp = LS.material_poles(elements, comp, lattice, d_nn, c_over_a)
+    elif recipe.sigma != "hl":
+        raise ValueError(f"unknown self-energy {recipe.sigma!r}: 'hl' or 'mpse'")
+    if mp is not None and recipe.quinn:
+        raise ValueError("quinn=1 and sigma=mpse both add the low-energy loss; choose one")
     for a in elements:
         t0 = time.time()
         pts = CL.lattice_cluster(d_nn, recipe.radius, lattice, c_over_a)
         species = CL.alloy_species(pts, a, list(elements), d_nn, comp, recipe.seed)
-        cpot = PO.build(pts, species)
-        ph = PS.phase_shifts(cpot, k_grid, gamma_ev=GAMMA_K.get(a, 1.0), model=recipe.exchange)
+        scf_info = None
+        if recipe.scf:
+            res = SCF.build(pts, species, verbose=False, relativistic=rel)
+            cpot = res.potential
+            scf_info = dict(converged=bool(res.converged), iterations=len(res.history),
+                            net_charge=res.charges)
+        else:
+            cpot = PO.build(pts, species, relativistic=rel)
+        ph = PS.phase_shifts(cpot, k_grid, gamma_ev=GAMMA_K.get(a, 1.0), model=recipe.exchange,
+                             quinn=bool(recipe.quinn), mpse=mp)
         type_of = {t.symbol: i for i, t in enumerate(cpot.types) if i > 0}
         missing = [s for s in elements if s not in type_of]
         if missing:
@@ -188,7 +216,8 @@ def _compute(elements, comp, lattice, d_nn, c_over_a, recipe, verbose):
                       rs_int=float(cpot.rs_int),
                       r_mt_A={t.symbol if i else f"{t.symbol}*": float(t.r_mt * BOHR)
                               for i, t in enumerate(cpot.types)},
-                      gamma_ev=float(GAMMA_K.get(a, 1.0)), cluster_atoms=int(len(pts)))
+                      gamma_ev=float(GAMMA_K.get(a, 1.0)), cluster_atoms=int(len(pts)),
+                      scf=scf_info)
         if verbose:
             print(f"    {a}: {len(pts)} atoms, {len(groups)} multiple-scattering paths, "
                   f"{time.time() - t0:.1f}s", flush=True)

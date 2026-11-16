@@ -114,12 +114,45 @@ development branch): the atoms reproduce the NIST LDA tables to 1e-6 Ha; the
 path list and degeneracies reproduce FEFF8L's exactly; single-scattering
 amplitudes agree with FEFF8L to 1-2% (10% at p = 4 A^-1, where FEFF adds a
 sub-threshold loss) with a slowly varying phase offset of 0.1-0.3 rad, larger
-where Cr scatters. That offset is FEFF8L's self-consistent potential, which
-the native engine does not have yet (it uses overlapped atoms, so its Fermi
-level and Cr charge differ). Fitted to Kuzmin's Cu and Cr foil temperature
+where Cr scatters. Most of the Cr-specific part is FEFF8L's self-consistent
+potential (`scf=1` below removes it); the rest is a near-uniform offset. Fitted to Kuzmin's Cu and Cr foil temperature
 series with one Debye temperature, the native tables give S0^2 = 0.87 and
 theta_D = 323 K for Cu (literature 315-330 K) and R-factors of 0.02-0.04
 (`scripts/test_native_foils.py`).
+
+More physics is chosen in the recipe (`--tables native:rel=1,scf=1,sigma=mpse`;
+`native_tables.py --rel --scf --sigma mpse`); the defaults are the engine above.
+* `scf=1`: self-consistent potentials from the cluster Green's function
+  (`scf.py`): charge transfer and the Fermi level of the solid.
+* `rel=1`: scalar-relativistic atoms (Koelling-Harmon, relativistic exchange;
+  the NIST ScRLDA atoms to 6 micro-Hartree) and scattering states, with the
+  relativistic interstitial momentum. Phase shifts rise by 0.02-0.04 rad.
+* `sigma=mpse`: the many-pole self-energy of the material's measured loss
+  function (`losses.py`: CXRO f1/f2 and Werner et al. 2009 REELS optical
+  constants, mixed by composition, held to the perfect-screening sum rule).
+  Its inelastic mean free paths agree with the TPP-2M formula to 5-13% at
+  100-1000 eV for Cr, Co, Ni and Cu; the plasmon pole (FEFF8L's model) is
+  25-50% too long there.
+* `quinn=1`: Quinn's electron-hole loss below the plasmon (HL only).
+
+`scripts/foil_scoreboard.py` fits any path set - FEFF8L (run through a larch
+venv) or a native recipe - to the 10-11 K Cu and Cr foils the same way and
+reports the bond length against dilatometry (an exact theory reads about
+-0.06% there, from the fit model's missing sigma^2 phase term). First-shell
+miss, Cu / Cr: FEFF8L -0.40 / -0.26%; native defaults -0.09 / -0.04%;
+`rel=1,sigma=mpse` -0.05 / -0.01%; `rel=1,scf=1,sigma=mpse` -0.14 / -0.13%.
+FEFF8L's largest lever is its core hole (without it -0.20 / -0.04%).
+The many-pole self-energy fits Cu better over the full range but leaves the
+Cr amplitude ~40% high at k = 4 (R-factor 0.009 vs 0.005), unresolved: below
+~100 eV it loses too little energy.
+
+On the CrCoNi pressure series (`run_all.py --calibrate-only --k-axis table`)
+every native recipe without the many-pole self-energy fits as well as FEFF8L
+(stage-3 R 0.0098-0.0104 vs 0.0096; `rel=1,scf=1` 0.0099, with FEFF8L's
+dE0 to within 0.5 eV), the many-pole ones worse (0.0129). All native recipes
+read a0 0.13-0.19% longer than FEFF8L (3.5675-3.5692 vs 3.5624 A; literature
+3.559-3.567); B0 is 212 GPa throughout. Which is right needs the sample's own
+lattice constant.
 
 ## Blind synthetic data
 
@@ -203,6 +236,42 @@ Python with `xraylarch` (passed as `--larch-python`, as for the tables) and
 writes `k, chi` files in the layout above plus a `processing.json` with the
 E0, background and normalisation Athena used.
 
+### Opt-in extensions (2026-11)
+
+None of these changes a default.
+
+- **FEFF10.** `exafs_gpu/feff10.py` runs FEFF10's modules (binaries from
+  `$FEFF10_BIN`); `python feff10_tables.py --from <FEFF8L set> --tag fsr`
+  rebuilds a table set with it. On the Cu and Cr foils the standard core hole
+  (`fsr`) reproduces FEFF8L exactly. The screened core hole and the many-pole
+  loss models move the bond length further from the known value.
+- **Exact multiple scattering** (`chimera/mslibrary.py`). Every 3- and 4-leg
+  path falls into one of a few shapes (25 for fcc to 5.3 A). `mslibrary.build(<FEFF10 MS set>)`
+  has FEFF10 compute each shape with every assignment of species to its
+  sites (327 paths per absorber), on the potentials of an existing run. A
+  library name passed to `--ms-tables` gives the exact random-alloy average
+  for calibration, in place of one random cluster's average, which differs
+  by about 8%. `run_all --ms-library <name>` (or `Spectrum.attach_ms_library`)
+  makes the sampler sum multiple scattering over each configuration's own
+  paths, updated exactly at every swap. The library reproduces FEFF10's own
+  multiple scattering for its cluster to 4e-4 (`tests/test_mslibrary.py`).
+- **Energy-informed sampling.** `run_all --energy-prior data/physics/epi.json --anneal-T 1500`
+  (or `fit_one(energy_prior=(V, T))`) weighs every sampler move by the change
+  in the alloy's pair-interaction energy at the temperature its order froze
+  in, as well as by the data. The bundled interactions come from the NiCoCr
+  EAM potential (`scripts/physics_inputs.py`, `chimera/physics.py`,
+  `exafs_gpu/eam.py`). That potential's chemistry is known to be wrong for
+  CrCoNi, so use interactions from a DFT-quality source, in the same JSON
+  format, for a measurement.
+- **Disorder from molecular dynamics.** `ShellModel.set_physics(sigma2, dr, c3)`
+  takes the bond-length spread, mean bond length and third cumulant per shell
+  and pair type from `physics.pair_statistics`, in place of the fitted
+  values. With the EAM potential it fits worse than fitted disorder
+  (`scripts/test_physics_disorder.py`).
+
+The figures and the numbers are in
+`testing/figures/novelty_2026-11/novelty_progress.md` in the data tree.
+
 ## Layout
 
 ```
@@ -219,6 +288,11 @@ chimera/
                    table names; the default is equiatomic fcc CrCoNi
   multiscat.py     multiple-scattering paths (3- and 4-leg), from a table
                    directory or handed over in memory by the native engine
+  mslibrary.py     exact multiple scattering: species-resolved path library
+                   (built with FEFF10), random-alloy expectation, and the
+                   sampler's per-configuration path counts
+  physics.py       molecular-dynamics pair statistics and pair interactions
+                   from an interatomic potential (opt-in inputs)
   multift.py       per-edge Fourier transform (each edge has its own E0)
   calibrate.py     global search for E0, k window and weight, a0, sigma^2
                    scales, bond offsets dr, C3, MS amplitude
@@ -236,6 +310,9 @@ exafs_gpu/
   forward.py       GPU forward model and analytic adjoint
   fourier.py       k -> R transform, windows, adjoint
   kernels.py       CUDA source (NVRTC via CuPy)
+  eam.py           embedded-atom potential on the GPU: energies, forces,
+                   FIRE relaxation, Langevin dynamics
+  feff10.py        FEFF10 input writer and module runner
 methods/
   method_a_rmc.py  parallel-tempering RMC sampler
 scripts/
@@ -255,6 +332,8 @@ tools/
 feff8l_tables.py   generates data/ for an alloy on sc, bcc, fcc or hcp
                    (needs xraylarch)
 native_tables.py   the same tables from exafs_gpu/abinitio, no FEFF needed
+feff10_tables.py   a FEFF8L table set rebuilt with FEFF10 (core hole, exchange,
+                   loss-model options)
 ```
 
 ## Branches

@@ -16,6 +16,18 @@ Sigma is the energy-dependent self-energy (`selfenergy.local_sigma`) at the
 local density, Gamma the core-hole width (FEFF adds it the same way, as an
 imaginary part of the energy everywhere).
 
+Relativistic potentials (`potential.build(relativistic=True)`, read from the
+potential's meta) are solved with the scalar-relativistic Koelling-Harmon
+equation instead (`atom.py` has the form; the bracket above gains the
+mass-velocity and Darwin terms with M = 1 + (E - V - Sigma)/2c^2), and the
+interstitial momentum follows the relativistic dispersion
+p^2 = 2T (1 + T/2c^2), T = E - V_int - Sigma_int (FEFF: ck = sqrt(2T + (alpha T)^2)).
+At the sphere boundary P and Q = r g'/2M are continuous, so the log
+derivative carries the factor M_out/M_in. Compared with the
+non-relativistic solution the phase shifts of Cr-Ni rise by 0.02-0.04 rad
+(l = 0, 1) almost independently of energy - the electron is fast near the
+nucleus at every EXAFS energy - and the path phases by 0.04-0.08 rad.
+
 `phase_shifts` runs one CUDA thread per (type, energy, l) in double
 precision - a few milliseconds for a full table, so there is nothing to gain
 from single precision here and the Bessel recurrences at high l want the
@@ -28,6 +40,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .atom import C_LIGHT, sr_coefficients, sr_start_exponent
 from .potential import BOHR, HARTREE, ClusterPotential
 from .selfenergy import GAMMA_K, local_sigma
 
@@ -82,12 +95,41 @@ def _type_grid(r_mt):
     return np.exp(x), n_in - 1
 
 
-def _prepare(cp: ClusterPotential, k_A, gamma_ev, model, quinn, n_sigma_r=240):
-    """Potentials on each type's phase-shift grid, and the self-energy."""
+def interstitial_momentum(T, relativistic=False):
+    """Complex momentum of kinetic energy T (Ha, complex): p^2 = 2T, or
+    2T (1 + T/2c^2) relativistically; Im p >= 0."""
+    T = np.asarray(T, complex)
+    p2 = 2.0 * T * (1.0 + T / (2.0 * C_LIGHT ** 2)) if relativistic else 2.0 * T
+    p = np.sqrt(p2)
+    return np.where(p.imag < 0, -p, p)
+
+
+def _relativistic(cp, relativistic):
+    return bool(cp.meta.get("relativistic", False)) if relativistic is None else bool(relativistic)
+
+
+def _prepare(cp: ClusterPotential, k_A, gamma_ev, model, quinn, relativistic=False, n_sigma_r=240,
+             mpse=None):
+    """Each type's grid and the l-independent part U of the Numerov
+    coefficient, G = (l+1/2)^2 + U(E, r); the interstitial momentum; and the
+    boundary factors L_out = (L_in + ladd) * lmul (0 and 1 non-relativistically).
+    mpse: `losses.Poles` of the material; its many-pole correction to the HL
+    self-energy is added at every point (model must be 'hl')."""
     k_au = np.asarray(k_A, float) * BOHR
     e_rel = 0.5 * k_au ** 2
     gam = gamma_ev / HARTREE
-    grids, vc, sig, imt = [], [], [], []
+    E = cp.mu + e_rel
+    Ep = E + 0.5j * gam
+    dsig = np.zeros(e_rel.size, complex)
+    if mpse is not None:
+        if model != "hl":
+            raise ValueError("the many-pole self-energy corrects the HL one: model must be 'hl'")
+        from .losses import mpse_correction
+        dsig = mpse_correction(mpse, cp.rho_int, e_rel)
+    s_int = local_sigma(np.full(1, cp.rho_int), e_rel, model, quinn, relativistic) + dsig
+    T = Ep - cp.v_int_coul - s_int                       # interstitial kinetic energy
+    p = interstitial_momentum(T, relativistic)
+    grids, Us, imt, ladd, lmul = [], [], [], [], []
     for t in cp.types:
         r, m = _type_grid(t.r_mt)
         x_src = np.log(t.r)
@@ -98,22 +140,28 @@ def _prepare(cp: ClusterPotential, k_A, gamma_ev, model, quinn, n_sigma_r=240):
         # through rho(r) only
         rc = np.exp(np.linspace(np.log(r[0]), np.log(r[-1]), n_sigma_r))
         rho_c = np.exp(np.interp(np.log(rc), np.log(r), lnrho))
-        s_c = local_sigma(rho_c[None, :], e_rel[:, None], model, quinn)   # (nE, nc)
+        s_c = local_sigma(rho_c[None, :], e_rel[:, None], model, quinn, relativistic) + dsig[:, None]
         s = np.empty((k_au.size, r.size), complex)
         for i in range(k_au.size):
             s[i] = (np.interp(np.log(r), np.log(rc), s_c[i].real)
                     + 1j * np.interp(np.log(r), np.log(rc), s_c[i].imag))
+        Vt = (rv / r)[None, :] + s                                         # (nE, nr)
+        if relativistic:
+            w = r[None, :] * Vt
+            wx = np.gradient(w, H_STEP, axis=1, edge_order=2)
+            wxx = np.gradient(wx, H_STEP, axis=1, edge_order=2)
+            U, _, M = sr_coefficients(r[None, :], Vt, Ep[:, None], w, wx, wxx, 0.0)
+            dM = -((wx[:, m] - w[:, m]) / r[m] ** 2) / (2.0 * C_LIGHT ** 2)   # M' just inside r_mt
+            ladd.append(dM / (2.0 * M[:, m]))
+            lmul.append((1.0 + T / (2.0 * C_LIGHT ** 2)) / M[:, m])
+        else:
+            U = 2.0 * r[None, :] ** 2 * (Vt - Ep[:, None])
+            ladd.append(np.zeros(k_au.size, complex))
+            lmul.append(np.ones(k_au.size, complex))
         grids.append(r)
-        vc.append(rv / r)
-        sig.append(s)
+        Us.append(U)
         imt.append(m)
-    # interstitial
-    s_int = local_sigma(np.full(1, cp.rho_int), e_rel, model, quinn)
-    E = cp.mu + e_rel
-    p2 = 2.0 * (E - cp.v_int_coul - s_int) + 1j * gam
-    p = np.sqrt(p2)
-    p = np.where(p.imag < 0, -p, p)
-    return k_au, e_rel, E, p, grids, vc, sig, imt, gam
+    return k_au, e_rel, E, p, grids, Us, imt, gam, np.array(ladd), np.array(lmul)
 
 
 def _sph_jn_yn(lmax, x):
@@ -159,20 +207,32 @@ def _match(lmax, x, p, LR):
     return -(pp * hmd - LR * hm) / (pp * hpd - LR * hp)
 
 
+def _start_values(l, Z, xs_ab, r_ab, relativistic, G0=None):
+    """Regular solution at the first two points (relative normalisation is
+    free): r^(l+1/2) (1 - Z r/(l+1)), or r^sqrt(G) scalar-relativistically
+    (G0 (nE,) the coefficient at the first point)."""
+    if relativistic:
+        s = sr_start_exponent(G0)
+        return np.exp(s * xs_ab[0]), np.exp(s * xs_ab[1])
+    corr = (1.0 - Z * r_ab / (l + 1.0)) if l < 3 else np.ones(2)
+    return np.exp((l + 0.5) * xs_ab) * corr
+
+
 def phase_shifts_numpy(cp: ClusterPotential, k_A=None, lmax=LMAX_DEFAULT, gamma_ev=None,
-                       model="hl", quinn=False):
+                       model="hl", quinn=False, relativistic=None, mpse=None):
     k_A = default_k_grid() if k_A is None else np.asarray(k_A, float)
     if gamma_ev is None:
         gamma_ev = GAMMA_K.get(cp.types[0].symbol, 1.0)
-    k_au, e_rel, E, p, grids, vc, sig, imt, gam = _prepare(cp, k_A, gamma_ev, model, quinn)
+    rel = _relativistic(cp, relativistic)
+    k_au, e_rel, E, p, grids, Us, imt, gam, ladd, lmul = _prepare(cp, k_A, gamma_ev, model, quinn, rel,
+                                                                 mpse=mpse)
     nE, nl = k_au.size, lmax + 1
     S = np.zeros((len(cp.types), nE, nl), complex)
     h2 = H_STEP ** 2
     ls = np.arange(nl)
     for it, t in enumerate(cp.types):
-        r, V, s, m = grids[it], vc[it], sig[it], imt[it]
-        G = ((ls[None, :] + 0.5) ** 2)[:, :, None] + 2.0 * r[None, None, :] ** 2 * (
-            V[None, None, :] + s[:, None, :] - E[:, None, None] - 0.5j * gam)
+        r, U, m = grids[it], Us[it], imt[it]
+        G = ((ls[None, :] + 0.5) ** 2)[:, :, None] + U[:, None, :]
         G = np.broadcast_to(G, (nE, nl, r.size))
         f = 1.0 - h2 * G / 12.0
         y = np.zeros((nE, nl, r.size), complex)
@@ -181,21 +241,20 @@ def phase_shifts_numpy(cp: ClusterPotential, k_A=None, lmax=LMAX_DEFAULT, gamma_
         i0 = np.array([max(0, int(np.searchsorted(xs, -35.0 / (l + 0.5)))) for l in ls])
         for l in ls:
             a, b = i0[l], i0[l] + 1
-            corr = (1.0 - t.Z * r[[a, b]] / (l + 1.0)) if l < 3 else 1.0
-            y[:, l, a] = np.exp((l + 0.5) * xs[a]) * (corr[0] if l < 3 else 1.0)
-            y[:, l, b] = np.exp((l + 0.5) * xs[b]) * (corr[1] if l < 3 else 1.0)
+            y[:, l, a], y[:, l, b] = _start_values(l, t.Z, xs[[a, b]], r[[a, b]], rel, G[:, l, a])
         for i in range(1, r.size - 1):
             act = i0 < i
             yn = ((12.0 - 10.0 * f[:, :, i]) * y[:, :, i] - f[:, :, i - 1] * y[:, :, i - 1]) / f[:, :, i + 1]
             y[:, :, i + 1] = np.where(act[None, :], yn, y[:, :, i + 1])
         dy = (y[:, :, m - 2] - 8 * y[:, :, m - 1] + 8 * y[:, :, m + 1] - y[:, :, m + 2]) / (12 * H_STEP)
-        LR = (dy / y[:, :, m] - 0.5) / r[m]
+        LR = ((dy / y[:, :, m] - 0.5) / r[m] + ladd[it][:, None]) * lmul[it][:, None]
         x = p * r[m]
         S[it] = _match(lmax, x, p, LR)
     return PhaseShifts(k=k_A, energy=e_rel, p=p, S=S, labels=[t.label for t in cp.types],
                        gamma_ch=gam, r_mt=np.array([t.r_mt for t in cp.types]),
                        meta=dict(model=model, quinn=quinn, mu=cp.mu, v_int_coul=cp.v_int_coul,
-                                 rho_int=cp.rho_int, lmax=lmax))
+                                 rho_int=cp.rho_int, lmax=lmax, relativistic=rel,
+                                 mpse=None if mpse is None else mpse.label))
 
 
 # --------------------------------------------------------------------------
@@ -208,13 +267,14 @@ typedef complex<double> cplx;
 
 extern "C" __global__ void radial_phase(
     const double* __restrict__ rgrid,    // (ntype, nr)
-    const double* __restrict__ vc,       // (ntype, nr)  Coulomb potential
-    const cplx*   __restrict__ sig,      // (ntype, nE, nr) self-energy
+    const cplx*   __restrict__ U,        // (ntype, nE, nr) G - (l+1/2)^2
     const int*    __restrict__ imt,      // (ntype,)  index of r_mt
     const int*    __restrict__ nrt,      // (ntype,)  valid points per type
     const double* __restrict__ zat,      // (ntype,)  nuclear charge
-    const cplx*   __restrict__ Ecplx,    // (nE,)  E + i Gamma/2 - (absolute)
     const cplx*   __restrict__ pint,     // (nE,)  interstitial momentum
+    const cplx*   __restrict__ ladd,     // (ntype, nE) boundary: L_out = (L_in + ladd) lmul
+    const cplx*   __restrict__ lmul,     // (ntype, nE)
+    const int rel, const double zc2,     // scalar-relativistic start (zc2 unused, kept for the ABI)
     const int ntype, const int nE, const int nr, const int nl, const double h,
     cplx* __restrict__ S)                // (ntype, nE, nl)
 {
@@ -224,11 +284,9 @@ extern "C" __global__ void radial_phase(
     int ie = (tid / nl) % nE;
     int it = tid / (nl * nE);
     const double* r = rgrid + (size_t)it * nr;
-    const double* V = vc + (size_t)it * nr;
-    const cplx* s = sig + ((size_t)it * nE + ie) * nr;
+    const cplx* u = U + ((size_t)it * nE + ie) * nr;
     const int m = imt[it];
     const int n = nrt[it];
-    const cplx E = Ecplx[ie];
     const double lam = (l + 0.5) * (l + 0.5);
     const double h2 = h * h / 12.0;
     const double xm = log(r[m]);
@@ -239,24 +297,32 @@ extern "C" __global__ void radial_phase(
         while (i0 < m - 8 && log(r[i0]) - xm < xs0) ++i0;
     }
     double Z = zat[it];
-    cplx y0 = exp((l + 0.5) * (log(r[i0]) - xm)) * ((l < 3) ? (1.0 - Z * r[i0] / (l + 1.0)) : 1.0);
-    cplx y1 = exp((l + 0.5) * (log(r[i0 + 1]) - xm)) * ((l < 3) ? (1.0 - Z * r[i0 + 1] / (l + 1.0)) : 1.0);
-    cplx f0 = 1.0 - h2 * (lam + 2.0 * r[i0] * r[i0] * (V[i0] + s[i0] - E));
-    cplx f1 = 1.0 - h2 * (lam + 2.0 * r[i0 + 1] * r[i0 + 1] * (V[i0 + 1] + s[i0 + 1] - E));
+    cplx y0, y1;
+    if (rel) {
+        // local power law y ~ r^sqrt(G): sqrt(l(l+1)+1-(Z/c)^2) at a nucleus, l+1/2 far from one
+        double s = sqrt(lam + u[i0].real());
+        y0 = exp(s * (log(r[i0]) - xm));
+        y1 = exp(s * (log(r[i0 + 1]) - xm));
+    } else {
+        y0 = exp((l + 0.5) * (log(r[i0]) - xm)) * ((l < 3) ? (1.0 - Z * r[i0] / (l + 1.0)) : 1.0);
+        y1 = exp((l + 0.5) * (log(r[i0 + 1]) - xm)) * ((l < 3) ? (1.0 - Z * r[i0 + 1] / (l + 1.0)) : 1.0);
+    }
+    cplx f0 = 1.0 - h2 * (lam + u[i0]);
+    cplx f1 = 1.0 - h2 * (lam + u[i0 + 1]);
     cplx ys[5];                 // y at m-2 .. m+2
     for (int q = 0; q < 5; ++q) ys[q] = cplx(0.0, 0.0);
     if (i0 >= m - 2) { if (i0 <= m + 2) ys[i0 - (m - 2)] = y0; }
     if (i0 + 1 >= m - 2 && i0 + 1 <= m + 2) ys[i0 + 1 - (m - 2)] = y1;
     for (int i = i0 + 1; i < n - 1; ++i) {
-        double ri = r[i + 1];
-        cplx f2 = 1.0 - h2 * (lam + 2.0 * ri * ri * (V[i + 1] + s[i + 1] - E));
+        cplx f2 = 1.0 - h2 * (lam + u[i + 1]);
         cplx y2 = ((12.0 - 10.0 * f1) * y1 - f0 * y0) / f2;
         y0 = y1; y1 = y2; f0 = f1; f1 = f2;
         int q = i + 1 - (m - 2);
         if (q >= 0 && q < 5) ys[q] = y2;
     }
     cplx dy = (ys[0] - 8.0 * ys[1] + 8.0 * ys[3] - ys[4]) / (12.0 * h);
-    cplx LR = (dy / ys[2] - 0.5) / r[m];
+    size_t ib = (size_t)it * nE + ie;
+    cplx LR = ((dy / ys[2] - 0.5) / r[m] + ladd[ib]) * lmul[ib];
     // free spherical waves at x = p r_mt: j_l, n_l, j_{l+1}, n_{l+1}
     cplx p = pint[ie];
     cplx x = p * r[m];
@@ -301,32 +367,37 @@ def _module():
 
 
 def phase_shifts(cp_: ClusterPotential, k_A=None, lmax=LMAX_DEFAULT, gamma_ev=None,
-                 model="hl", quinn=False) -> PhaseShifts:
-    """All phase shifts of a cluster's potential types on the GPU."""
+                 model="hl", quinn=False, relativistic=None, mpse=None) -> PhaseShifts:
+    """All phase shifts of a cluster's potential types on the GPU.
+    `relativistic` defaults to how the potential was built; `mpse` (a
+    `losses.Poles`) adds the many-pole self-energy of the material."""
     import cupy as cp
     k_A = default_k_grid() if k_A is None else np.asarray(k_A, float)
     if gamma_ev is None:
         gamma_ev = GAMMA_K.get(cp_.types[0].symbol, 1.0)
-    k_au, e_rel, E, p, grids, vc, sig, imt, gam = _prepare(cp_, k_A, gamma_ev, model, quinn)
+    rel = _relativistic(cp_, relativistic)
+    k_au, e_rel, E, p, grids, Us, imt, gam, ladd, lmul = _prepare(cp_, k_A, gamma_ev, model, quinn, rel,
+                                                                 mpse=mpse)
     nt, nE, nl = len(cp_.types), k_au.size, lmax + 1
     nr = max(g.size for g in grids)
-    R = np.ones((nt, nr)); Vc = np.zeros((nt, nr)); Sg = np.zeros((nt, nE, nr), complex)
+    R = np.ones((nt, nr)); Ua = np.zeros((nt, nE, nr), complex)
     nrt = np.zeros(nt, np.int32)
     for i in range(nt):
         n = grids[i].size
-        R[i, :n], Vc[i, :n], Sg[i, :, :n], nrt[i] = grids[i], vc[i], sig[i], n
-    Ec = E + 0.5j * gam
+        R[i, :n], Ua[i, :, :n], nrt[i] = grids[i], Us[i], n
     out = cp.zeros((nt, nE, nl), cp.complex128)
     ker = _module().get_function("radial_phase")
     nthr = nt * nE * nl
     block = 128
     ker(((nthr + block - 1) // block,), (block,),
-        (cp.asarray(R), cp.asarray(Vc), cp.asarray(Sg), cp.asarray(np.array(imt, np.int32)),
+        (cp.asarray(R), cp.asarray(Ua), cp.asarray(np.array(imt, np.int32)),
          cp.asarray(nrt), cp.asarray(np.array([t.Z for t in cp_.types], float)),
-         cp.asarray(Ec.astype(complex)), cp.asarray(p.astype(complex)),
+         cp.asarray(p.astype(complex)), cp.asarray(np.ascontiguousarray(ladd, complex)),
+         cp.asarray(np.ascontiguousarray(lmul, complex)), np.int32(rel), np.float64(1.0 / C_LIGHT ** 2),
          np.int32(nt), np.int32(nE), np.int32(nr), np.int32(nl), np.float64(H_STEP), out))
     return PhaseShifts(k=k_A, energy=e_rel, p=p, S=cp.asnumpy(out),
                        labels=[t.label for t in cp_.types], gamma_ch=gam,
                        r_mt=np.array([t.r_mt for t in cp_.types]),
                        meta=dict(model=model, quinn=quinn, mu=cp_.mu,
-                                 v_int_coul=cp_.v_int_coul, rho_int=cp_.rho_int, lmax=lmax))
+                                 v_int_coul=cp_.v_int_coul, rho_int=cp_.rho_int, lmax=lmax,
+                                 relativistic=rel, mpse=None if mpse is None else mpse.label))

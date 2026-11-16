@@ -15,6 +15,8 @@ Layout conventions
   drtab  (nshell*NSP*NSP,)    bond-length offset by (shell, pair type): the
                               size-mismatch term, r_eff = r + dr[shell][type]
   c3tab  (nshell,)            third cumulant by shell: phase -(4/3) k^3 C3
+  s2tab  (nshell*NSP*NSP,)    sigma^2 added by (shell, pair type), zero unless the
+                              disorder of each pair type is set (chimera/physics)
   chi    (nconf, NSP, nk)     unnormalised per-absorber EXAFS
 
 The pair term evaluated everywhere below is the standard cumulant expansion
@@ -107,6 +109,7 @@ extern "C" __global__ void chi_forward(
     const double* __restrict__ ktab,    // (nk)
     const double* __restrict__ drtab,   // (nshell*NSP*NSP)
     const double* __restrict__ c3tab,   // (nshell)
+    const double* __restrict__ s2tab,   // (nshell*NSP*NSP) added to sig2 by pair type
     double*       __restrict__ chi,     // (nconf, NSP, nk)
     int npairs, int nk, int nconf, double s02)
 {
@@ -134,7 +137,7 @@ extern "C" __global__ void chi_forward(
         double rr = rc[p] + drtab[sh*NSP*NSP + t];
         int sa = t / NSP, sb = t - sa*NSP;
         double amp = s02 * sf[sb] / (sk * rr * rr)
-                   * exp(-2.0*rr/slam + dw_k*sig2[p]);
+                   * exp(-2.0*rr/slam + dw_k*(sig2[p] + s2tab[sh*NSP*NSP + t]));
         double v = amp * sin(2.0*sk*rr + sd[t] - c3k*c3tab[sh]);
         // unrolled predicated add keeps acc[] in registers despite the
         // runtime index sa
@@ -173,6 +176,7 @@ extern "C" __global__ void chi_adjoint_r(
     const double* __restrict__ ktab,
     const double* __restrict__ drtab,
     const double* __restrict__ c3tab,
+    const double* __restrict__ s2tab,
     const double* __restrict__ gchi,    // (nconf, NSP, nk)
     double*       __restrict__ gr,      // (nconf, npairs)
     int npairs, int nk, int nconf, double s02)
@@ -188,7 +192,7 @@ extern "C" __global__ void chi_adjoint_r(
     double rr = r[tid] + drtab[sh*NSP*NSP + t];
     double c3 = c3tab[sh];
     int sa = t / NSP, sb = t - sa*NSP;
-    double s2 = sig2[p];
+    double s2 = sig2[p] + s2tab[sh*NSP*NSP + t];
     const double* g = gchi + ((long)ic * NSP + sa) * nk;
 
     double acc = 0.0;
@@ -252,6 +256,7 @@ extern "C" __global__ void chi_delta(
     const double* __restrict__ ktab,
     const double* __restrict__ drtab,
     const double* __restrict__ c3tab,
+    const double* __restrict__ s2tab,    // (nshell*NSP*NSP)
     double*       __restrict__ dchi,     // (nrep, NSP, nk)
     int npairs, int nk, int nrep, int maxaff, double s02)
 {
@@ -283,11 +288,12 @@ extern "C" __global__ void chi_delta(
         int sh = shell[p];
         double ph3 = c3k * c3tab[sh];
         const double* drs = drtab + sh*NSP*NSP;
+        const double* s2s = s2tab + sh*NSP*NSP;
         // new contribution
         int t = tn[q];
         double rr = rn[q] + drs[t];
         int sa = t / NSP, sb = t - sa*NSP;
-        double v = s02 * sf[sb] / (sk*rr*rr) * exp(-2.0*rr/slam + dw_k*s2)
+        double v = s02 * sf[sb] / (sk*rr*rr) * exp(-2.0*rr/slam + dw_k*(s2 + s2s[t]))
                  * sin(2.0*sk*rr + sd[t] - ph3);
         #pragma unroll
         for (int s = 0; s < NSP; ++s) if (sa == s) acc[s] += v;
@@ -295,7 +301,7 @@ extern "C" __global__ void chi_delta(
         t = to[p];
         rr = ro[p] + drs[t];
         sa = t / NSP; sb = t - sa*NSP;
-        v = s02 * sf[sb] / (sk*rr*rr) * exp(-2.0*rr/slam + dw_k*s2)
+        v = s02 * sf[sb] / (sk*rr*rr) * exp(-2.0*rr/slam + dw_k*(s2 + s2s[t]))
           * sin(2.0*sk*rr + sd[t] - ph3);
         #pragma unroll
         for (int s = 0; s < NSP; ++s) if (sa == s) acc[s] -= v;

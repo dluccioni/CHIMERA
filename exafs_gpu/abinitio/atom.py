@@ -3,14 +3,16 @@
 This is the first step of the scattering calculation: the free-atom charge
 density and Coulomb potential that are superposed into the muffin-tin
 potentials of a cluster (see `potential.py`). FEFF uses a relativistic
-Dirac-Fock atom for the same purpose; this module solves the
-non-relativistic Kohn-Sham equations with the Vosko-Wilk-Nusair (VWN5)
-correlation, which reproduces the NIST LDA reference atoms to the
-micro-Hartree (`tests/test_abinitio_atom.py`). For the 3d metals the missing
-relativistic contraction of the 1s/2s shells changes the potential only
-inside ~0.05 bohr, where it has no measurable effect on the scattering phase
-shifts at EXAFS energies; for 5d elements and heavier it would matter, and a
-warning is printed.
+Dirac-Fock atom for the same purpose. This module solves the Kohn-Sham
+equations with the Vosko-Wilk-Nusair (VWN5) correlation, either
+non-relativistically (reproduces the NIST LDA reference atoms to the
+micro-Hartree) or scalar-relativistically (`relativistic=True`: the
+Koelling-Harmon equation, mass-velocity and Darwin terms, spin-orbit
+averaged; reproduces the NIST ScRLDA atoms, `tests/test_abinitio_engine.py`).
+Relativity contracts the 1s/2s shells of a 3d metal by a few per cent (the
+density at the nucleus rises 13-15% for Cr-Ni) and moves the 1s level by
+1-3 keV x 1e-3; the scattering phase shifts shift by 0.02-0.04 rad at every
+energy (`phaseshift.py`).
 
 Units are Hartree atomic units throughout (bohr, Hartree).
 
@@ -22,11 +24,23 @@ grid r = exp(x). With u = r^(1/2) y it becomes y'' = [(l+1/2)^2 +
 Numerov's method: outward from the origin to the classical turning point and
 inward from the decaying tail, matched there. The eigenvalue is bracketed by
 node counting and refined with the matching correction
-    d eps = - y_c K / (2 h^2 sum r^2 y^2),
+    d eps = - y_c K / (h^2 sum g y^2),   g = -dG/d eps  (= 2 r^2 here),
 K being the Numerov residual of the kink at the matching point. The loops
 are plain Python on scalars, which for ~2300 grid points is faster than
 numpy; a full self-consistent 3d-metal atom takes a few seconds and is
 cached on disk.
+
+Scalar-relativistic (Koelling & Harmon, J. Phys. C 10, 3107 (1977)). With
+M = 1 + (eps - V)/(2c^2) and P = r g the large component,
+    P' = 2 M Q + P/r,   Q' = -Q/r + [l(l+1)/(2 M r^2) + V - eps] P.
+P = sqrt(M) r^(1/2) y removes the first derivative again, so the same
+Numerov integration applies with, w = r V and subscripts d/dx,
+    y'' = [(l+1/2)^2 + 2 r^2 M (V - eps) + (w_xx - w_x)/(4 c^2 M r)
+           + 3 (w_x - w)^2 / (16 c^4 M^2 r^2)] y.
+Near the nucleus y ~ r^s, s = sqrt(l(l+1) + 1 - (Z/c)^2) (the bracket's
+value there; the integration starts from the local s = sqrt(G)). The density is
+that of the large component normalised to one (NIST's ScRLDA convention:
+the minor component enters only through that normalisation).
 """
 from __future__ import annotations
 
@@ -40,6 +54,8 @@ import numpy as np
 from scipy.integrate import cumulative_simpson, simpson
 
 from ..scattering import SYMBOLS, Z_TABLE
+
+C_LIGHT = 137.035999084        # speed of light in atomic units (CODATA 2018, 1/alpha)
 
 # ---------------------------------------------------------------------------
 # electron configurations
@@ -141,11 +157,32 @@ def rs_of(n):
     return (3.0 / (4.0 * np.pi * n)) ** (1.0 / 3.0)
 
 
-def lda_xc(n):
-    """(eps_xc, v_xc) per electron, Hartree: Slater exchange + VWN5 correlation."""
+def relativistic_exchange_factors(n, c=C_LIGHT):
+    """MacDonald-Vosko (J. Phys. C 12, 2977 (1979)) relativistic electron-gas
+    exchange: eps_x = eps_x^NR Phi(beta), v_x = v_x^NR R(beta), beta = kF/c.
+    Matters only at core densities (beta 0.1-0.4 inside ~0.2 bohr of a 3d
+    metal's nucleus)."""
+    kf = (3.0 * np.pi ** 2 * np.maximum(np.asarray(n, float), 1e-30)) ** (1.0 / 3.0)
+    b = kf / c
+    eta = np.sqrt(1.0 + b * b)
+    ash = np.arcsinh(b)
+    small = b < 1e-3
+    bs = np.where(small, 1.0, b)
+    phi = np.where(small, 1.0 - 2.0 / 3.0 * b * b,
+                   1.0 - 1.5 * ((bs * eta - ash) / (bs * bs)) ** 2)
+    R = np.where(small, 1.0 - b * b, -0.5 + 1.5 * ash / (bs * eta))
+    return phi, R
+
+
+def lda_xc(n, relativistic=False):
+    """(eps_xc, v_xc) per electron, Hartree: Slater exchange + VWN5 correlation.
+    relativistic: MacDonald-Vosko correction of the exchange (RLDA)."""
     n = np.maximum(np.asarray(n, float), 1e-30)
     ex = -_CX * n ** (1.0 / 3.0)
     vx = 4.0 / 3.0 * ex
+    if relativistic:
+        phi, R = relativistic_exchange_factors(n)
+        ex, vx = ex * phi, vx * R
     rs = rs_of(n)
     x = np.sqrt(rs)
     A, x0, b, c = _VWN_A, _VWN_X0, _VWN_B, _VWN_C
@@ -222,26 +259,68 @@ def _numerov_in(G, h2, istart, iend):
     return y
 
 
+def sr_derivatives(r, V, h):
+    """w = r V and its first two derivatives in x = ln r (second order)."""
+    w = np.asarray(r * V, float)
+    wx = np.gradient(w, h, edge_order=2)
+    wxx = np.gradient(wx, h, edge_order=2)
+    return w, wx, wxx
+
+
+def sr_coefficients(r, V, eps, w, wx, wxx, lam, c=C_LIGHT):
+    """Scalar-relativistic Numerov coefficient G(x) and g = -dG/d eps.
+
+    V and eps may be complex (a complex self-energy); M = 1 + (eps - V)/2c^2."""
+    c2 = c * c
+    M = 1.0 + (eps - V) / (2.0 * c2)
+    a = (wxx - wx) / (4.0 * c2 * r)
+    b = 3.0 * (wx - w) ** 2 / (16.0 * c2 * c2 * r * r)
+    G = lam + 2.0 * r * r * M * (V - eps) + a / M + b / (M * M)
+    g = 2.0 * r * r * (2.0 * M - 1.0) + a / (2.0 * c2 * M * M) + b / (c2 * M ** 3)
+    return G, g, M
+
+
+def sr_start_exponent(G0):
+    """y ~ r^s with s = sqrt(G) at the first grid point of the
+    scalar-relativistic equation: s -> sqrt(l(l+1) + 1 - (Z/c)^2) where the
+    nucleus dominates (M >> 1), l + 1/2 where it does not (no nucleus, or a
+    high-l start far out)."""
+    return np.sqrt(np.real(G0))
+
+
 def solve_bound(V, grid: LogGrid, l: int, nodes: int, Z: float,
-                eps_guess: float | None = None, tol: float = 1e-11):
+                eps_guess: float | None = None, tol: float = 1e-11, relativistic: bool = False):
     """One bound eigenstate of the radial equation in potential V(r).
 
     Returns (eps, y) with y normalised so that int u^2 dr = 1 (u = r^0.5 y).
+    Scalar-relativistic: y is returned as sqrt(M) times the Numerov solution,
+    so that u = r^0.5 y is the large component P, normalised the same way.
     """
     r = grid.r
     h2 = grid.h ** 2
     lam = (l + 0.5) ** 2
-    Vr2 = 2.0 * r * r
     Vl = V.tolist() if isinstance(V, np.ndarray) else list(V)
     rl = r.tolist()
     n = grid.n
-    lo = -0.6 * Z * Z - 10.0
+    lo = -0.6 * Z * Z - 10.0 - (0.3 * Z ** 4 / C_LIGHT ** 2 if relativistic else 0.0)
     hi = 0.0
     eps = eps_guess if eps_guess is not None and lo < eps_guess < hi else -0.5 * (Z / (nodes + l + 1)) ** 2
-    y0 = rl[0] ** (l + 0.5) * (1.0 - Z * rl[0] / (l + 1.0))
-    y1 = rl[1] ** (l + 0.5) * (1.0 - Z * rl[1] / (l + 1.0))
-    for _ in range(200):
-        G = [lam + 2.0 * rr * rr * (v - eps) for rr, v in zip(rl, Vl)]
+    if relativistic:
+        Va = np.asarray(V, float)
+        w, wx, wxx = sr_derivatives(r, Va, grid.h)
+        G0, _, _ = sr_coefficients(r[:1], Va[:1], eps, w[:1], wx[:1], wxx[:1], lam)
+        s = float(sr_start_exponent(G0[0]))
+        y0, y1 = rl[0] ** s, rl[1] ** s
+    else:
+        y0 = rl[0] ** (l + 0.5) * (1.0 - Z * rl[0] / (l + 1.0))
+        y1 = rl[1] ** (l + 0.5) * (1.0 - Z * rl[1] / (l + 1.0))
+    gw = None
+    for _ in range(300):
+        if relativistic:
+            Ga, ga, _M = sr_coefficients(r, Va, eps, w, wx, wxx, lam)
+            G, gw = Ga.tolist(), ga.tolist()
+        else:
+            G = [lam + 2.0 * rr * rr * (v - eps) for rr, v in zip(rl, Vl)]
         # classical turning point: last index with G < 0
         ic = None
         for i in range(n - 1, 0, -1):
@@ -271,9 +350,14 @@ def solve_bound(V, grid: LogGrid, l: int, nodes: int, Z: float,
         f = lambda i: 1.0 - h2 * G[i] / 12.0
         K = f(ic - 1) * yout[ic - 1] + f(ic + 1) * yin[2] * sc - (12.0 - 10.0 * f(ic)) * yout[ic]
         norm = 0.0
-        for i in range(len(ym)):
-            norm += rl[i] * rl[i] * ym[i] * ym[i]
-        deps = -yout[ic] * K / (2.0 * h2 * norm)
+        if relativistic:
+            for i in range(len(ym)):
+                norm += gw[i] * ym[i] * ym[i]
+            deps = -yout[ic] * K / (h2 * norm)
+        else:
+            for i in range(len(ym)):
+                norm += rl[i] * rl[i] * ym[i] * ym[i]
+            deps = -yout[ic] * K / (2.0 * h2 * norm)
         if deps > 0:
             lo = max(lo, eps)
         else:
@@ -289,6 +373,8 @@ def solve_bound(V, grid: LogGrid, l: int, nodes: int, Z: float,
         raise RuntimeError(f"bound state l={l} nodes={nodes} did not converge")
     y = np.zeros(n)
     y[:len(ym)] = ym
+    if relativistic:
+        y *= np.sqrt(1.0 + (eps - Va) / (2.0 * C_LIGHT ** 2))     # P = sqrt(M) r^1/2 y
     nrm = grid.integrate(r * y * y)          # int u^2 dr = int r y^2 dr
     y /= math.sqrt(nrm)
     if y[ic] < 0:
@@ -322,6 +408,7 @@ class Atom:
     v_xc: np.ndarray | None = None
     energy: float = 0.0
     iterations: int = 0
+    relativistic: bool = False                    # scalar-relativistic orbitals
 
     @property
     def r(self):
@@ -346,10 +433,14 @@ def hartree(grid, rho):
 
 def solve_atom(Z: int, occupations: dict | None = None, grid: LogGrid | None = None,
                tol: float = 1e-9, max_iter: int = 300, mix: float = 0.4,
-               history: int = 6, verbose: bool = False) -> Atom:
+               history: int = 6, verbose: bool = False, relativistic: bool = False,
+               rel_xc: bool | None = None) -> Atom:
     """Self-consistent LDA atom. `occupations` defaults to the ground state;
-    fractional occupations are fine."""
-    if Z > 54:
+    fractional occupations are fine. `relativistic`: scalar-relativistic
+    (Koelling-Harmon) orbitals instead of Schroedinger ones; `rel_xc` (default:
+    the same as `relativistic`) adds the MacDonald-Vosko exchange correction."""
+    rel_xc = relativistic if rel_xc is None else rel_xc
+    if Z > 54 and not relativistic:
         print(f"warning: Z={Z}: non-relativistic atom, core densities of heavy "
               "elements will be off")
     occ = dict(occupations) if occupations is not None else ground_configuration(Z)
@@ -364,14 +455,14 @@ def solve_atom(Z: int, occupations: dict | None = None, grid: LogGrid | None = N
         orbs = {}
         for name, f in sorted(occ.items(), key=lambda t: parse_orbital(t[0])):
             nq, l = parse_orbital(name)
-            e, y = solve_bound(V, grid, l, nq - l - 1, Z, eps.get(name))
+            e, y = solve_bound(V, grid, l, nq - l - 1, Z, eps.get(name), relativistic=relativistic)
             eps[name] = e
             orbs[name] = y
         rho = np.zeros_like(r)
         for name, f in occ.items():
             rho += f * orbs[name] ** 2 / (4.0 * np.pi * r)
         vh = hartree(grid, rho)
-        exc, vxc = lda_xc(rho)
+        exc, vxc = lda_xc(rho, rel_xc)
         Vout = -Z / r + vh + vxc
         res = Vout - V
         # convergence in r*V (the Coulomb tail would otherwise dominate)
@@ -405,7 +496,7 @@ def solve_atom(Z: int, occupations: dict | None = None, grid: LogGrid | None = N
     else:
         raise RuntimeError(f"atom Z={Z} not converged after {max_iter} iterations (err {err:.1e})")
     atom = Atom(Z=Z, occupations=occ, grid=grid, eps=eps, orbitals=orbs, rho=rho,
-                v_coulomb=-Z / r + vh, v_xc=vxc, iterations=it)
+                v_coulomb=-Z / r + vh, v_xc=vxc, iterations=it, relativistic=relativistic)
     # total energy: sum f eps - 1/2 int rho V_H + int rho (eps_xc - v_xc)
     band = sum(occ[k] * eps[k] for k in occ)
     eh = 0.5 * grid.integrate(4.0 * np.pi * r * r * rho * vh)
@@ -429,13 +520,16 @@ def _cache_dir():
     return d
 
 
-def cached_atom(Z: int, occupations: dict | None = None, grid: LogGrid | None = None) -> Atom:
+def cached_atom(Z: int, occupations: dict | None = None, grid: LogGrid | None = None,
+                relativistic: bool = False) -> Atom:
     occ = dict(occupations) if occupations is not None else ground_configuration(Z)
     grid = grid or LogGrid()
-    key = json.dumps(dict(Z=Z, occ=sorted(occ.items()), g=[grid.rmin, grid.rmax, grid.h],
-                          v=3), sort_keys=True)
+    kd = dict(Z=Z, occ=sorted(occ.items()), g=[grid.rmin, grid.rmax, grid.h], v=3)
+    if relativistic:
+        kd["rel"] = "scalar-KH-1"
+    key = json.dumps(kd, sort_keys=True)
     tag = hashlib.sha1(key.encode()).hexdigest()[:16]
-    fn = os.path.join(_cache_dir(), f"atom_{SYMBOLS[Z - 1]}_{tag}.npz")
+    fn = os.path.join(_cache_dir(), f"atom_{SYMBOLS[Z - 1]}_{'sr_' if relativistic else ''}{tag}.npz")
     if os.path.exists(fn):
         d = np.load(fn, allow_pickle=False)
         names = [str(s) for s in d["names"]]
@@ -443,8 +537,8 @@ def cached_atom(Z: int, occupations: dict | None = None, grid: LogGrid | None = 
                     eps={n: float(e) for n, e in zip(names, d["eps"])},
                     orbitals={n: d["orb"][i] for i, n in enumerate(names)},
                     rho=d["rho"], v_coulomb=d["vc"], v_xc=d["vxc"],
-                    energy=float(d["energy"]), iterations=int(d["it"]))
-    a = solve_atom(Z, occ, grid)
+                    energy=float(d["energy"]), iterations=int(d["it"]), relativistic=relativistic)
+    a = solve_atom(Z, occ, grid, relativistic=relativistic)
     names = sorted(a.orbitals)
     np.savez(fn, names=np.array(names), eps=np.array([a.eps[n] for n in names]),
              orb=np.array([a.orbitals[n] for n in names]), rho=a.rho,
@@ -452,8 +546,8 @@ def cached_atom(Z: int, occupations: dict | None = None, grid: LogGrid | None = 
     return a
 
 
-def atom_for(symbol: str, core_hole: str | None = None) -> Atom:
+def atom_for(symbol: str, core_hole: str | None = None, relativistic: bool = False) -> Atom:
     """Ground-state atom, or the final-state absorber with `core_hole` ('1s')."""
     Z = Z_TABLE[symbol]
     occ = ground_configuration(Z) if core_hole is None else core_hole_configuration(Z, core_hole)
-    return cached_atom(Z, occ)
+    return cached_atom(Z, occ, relativistic=relativistic)
