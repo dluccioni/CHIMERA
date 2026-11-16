@@ -6,7 +6,7 @@ Layout conventions
   nconf   batch dimension: MC replicas, or ensemble snapshots, or both
   npairs  ordered neighbour pairs, fixed topology, shared across the batch
   nk      wavenumber grid points
-  NSP=3   species (Cr, Co, Ni)
+  NSP     number of species, a compile-time constant (see module())
 
   r      (nconf, npairs)      pair distances
   ptype  (nconf, npairs)      absorber*NSP + scatterer
@@ -32,8 +32,8 @@ Performance notes
 -----------------
 * Distances are computed once per configuration, then reused for all nk. Folding
   the distance calculation into the chi kernel would repeat it nk times.
-* blockIdx.x indexes k, so the 13 k-dependent table values (3 amplitudes,
-  9 phases, lambda) are loaded into shared memory once per block and reused
+* blockIdx.x indexes k, so the k-dependent table values (NSP amplitudes,
+  NSP^2 phases, lambda) are loaded into shared memory once per block and reused
   across every pair. The inner loop is then pure arithmetic on one global read.
 * Each block owns one (k, conf) pair, so the per-absorber reduction is entirely
   within-block: no global atomics in the forward pass.
@@ -41,14 +41,12 @@ Performance notes
 from __future__ import annotations
 import cupy as cp
 
-NSP = 3
-
 _SRC = r"""
 // NSP is injected at compile time by module(nsp) via -DNSP=<n>, so the same
 // source serves any number of species while keeping every per-species array a
 // compile-time size (and therefore in registers, not local memory).
 #ifndef NSP
-#define NSP 3
+#error "compile with -DNSP=<number of species>"
 #endif
 
 // ---------------------------------------------------------------- distances
@@ -665,7 +663,7 @@ extern "C" __global__ void chi_adjoint_soft(
 _MODULES = {}
 
 
-def module(nsp=NSP):
+def module(nsp):
     """Compile (and cache) the kernels for a given number of species.
 
     NVRTC compiles at run time, so the species count is injected as -DNSP=<n>.
@@ -684,5 +682,5 @@ def module(nsp=NSP):
     return _MODULES[nsp]
 
 
-def get(name, nsp=NSP):
+def get(name, nsp):
     return module(nsp).get_function(name)

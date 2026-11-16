@@ -17,9 +17,14 @@ composition. With RPATH just past d only the nearest-neighbour paths are
 generated, one per scatterer.
 
     python feff8l_tables.py --larch-python <venv>/Scripts/python.exe \\
-        --elements Cr Co Ni --d-nn 2.517 --name crconi_fcc2517
+        --elements Fe Ni --d-nn 2.538 --name feni_fcc2538
     python feff8l_tables.py --larch-python <venv>/Scripts/python.exe \\
-        --elements Fe Ni --lattice bcc --d-nn 2.482 --name feni_bcc2482
+        --elements Fe Ni --d-nn 2.538 --name feni_fcc2538_ms --rpath 5.3 --nleg 4
+    python feff8l_tables.py --larch-python <venv>/Scripts/python.exe \\
+        --elements Fe Cr --lattice bcc --d-nn 2.485 --name fecr_bcc2485
+
+`--d-nn` is the nearest-neighbour distance of the reference cell (for fcc,
+a0 / sqrt(2)); the fit rescales path lengths from it to the fitted a0.
 
 `meta.json` next to the tables records the elements, composition, lattice
 and spacing, which `chimera.system.AlloySystem.from_tables` reads back.
@@ -123,14 +128,16 @@ def write_input(folder, absorber, elements, pts, d_nn, seed=0, rpath=None, nleg=
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--larch-python", required=True)
-    ap.add_argument("--elements", nargs="+", default=["Cr", "Co", "Ni"])
+    ap.add_argument("--elements", nargs="+", required=True,
+                    help="absorbing elements, in the order the fit will use")
     ap.add_argument("--composition", type=float, nargs="+", default=None,
                     help="atomic fractions in element order (default equiatomic)")
     ap.add_argument("--lattice", default="fcc", choices=list(LATTICES))
     ap.add_argument("--c-over-a", type=float, default=None, help="hcp only")
-    ap.add_argument("--d-nn", type=float, default=2.517)
+    ap.add_argument("--d-nn", type=float, required=True,
+                    help="nearest-neighbour distance of the reference cell (A)")
     ap.add_argument("--radius", type=float, default=6.5)
-    ap.add_argument("--name", default="crconi_fcc2517")
+    ap.add_argument("--name", required=True, help="the set is written to data/<name>/")
     ap.add_argument("--rpath", type=float, default=None,
                     help="max half-path length (A); default = first shell only")
     ap.add_argument("--nleg", type=int, default=2,

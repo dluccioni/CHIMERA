@@ -1,8 +1,9 @@
 """Disorder and energetics of the alloy from an interatomic potential.
 
 Two things the EXAFS fit otherwise has to guess, taken instead from an
-embedded-atom potential for the alloy (`exafs_gpu.eam`; for CrCoNi the
-Li, Sheng & Ma 2019 NiCoCr potential, data/_external/potentials):
+embedded-atom potential for the alloy (`exafs_gpu.eam`, which reads a LAMMPS
+`eam/alloy` setfl file; none is shipped, pass its path as `potential`). fcc
+lattices only:
 
 1. `pair_statistics` - molecular dynamics of random supercells at the
    measured lattice constant and temperature. For every coordination shell
@@ -22,8 +23,10 @@ Li, Sheng & Ma 2019 NiCoCr potential, data/_external/potentials):
    lets the sampler weigh each move by exp(-dE/kT) at the temperature the
    sample was last annealed at (`methods.method_a_rmc`, `energy_prior`).
 
-Species are in CHIMERA's order (Cr, Co, Ni by default); the potential's own
-element order is mapped by symbol.
+Species are in CHIMERA's order (the system's `elements`); the potential's own
+element order is mapped by symbol. `composition` defaults to equiatomic.
+The quality of both results is the quality of the potential: check its
+chemistry for the alloy before using either in a measurement.
 """
 from __future__ import annotations
 
@@ -37,14 +40,17 @@ import numpy as np
 HBAR_EVFS = 0.6582119569          # eV fs
 KB_EV = 8.617333262e-5
 AMU = 103.642697                  # eV fs^2 / A^2
-POTENTIAL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "data", "_external", "potentials", "NiCoCr.lammps.eam")
 
 
 def fcc_supercell(n, a):
     b = np.array([[0, 0, 0], [0, .5, .5], [.5, 0, .5], [.5, .5, 0]])
     g = np.array([[i, j, k] for i in range(n) for j in range(n) for k in range(n)])
     return ((g[:, None, :] + b[None]) * a).reshape(-1, 3), np.eye(3) * n * a
+
+
+def _comp(elements, composition):
+    return (np.ones(len(elements)) if composition is None
+            else np.asarray(composition, float))
 
 
 def random_species(natoms, composition, nconf, seed=0):
@@ -125,12 +131,13 @@ def _finish(acc):
     return m1, m2, m3, acc[..., 0]
 
 
-def pair_statistics(a0, T, elements=("Cr", "Co", "Ni"), composition=(1, 1, 1), ncell=6,
+def pair_statistics(a0, T, elements, potential, composition=None, ncell=6,
                     nconf=8, n_equil=3000, n_sample=15000, every=20, dt=2.0, nshell=6,
-                    seed=0, species=None, potential=POTENTIAL, verbose=True) -> PairStats:
+                    seed=0, species=None, verbose=True) -> PairStats:
     """Molecular dynamics of `nconf` random supercells (or the given `species`,
     (nconf, natoms) in CHIMERA's order) at lattice constant a0 and temperature
     T; pair-distance moments by shell and pair type, plus the relaxed ones."""
+    composition = _comp(elements, composition)
     from exafs_gpu import eam as EAM
     t0 = time.time()
     pot, cell, pmap, cp = _cell(elements, a0, ncell, potential)
@@ -324,9 +331,9 @@ def _epi_fit(X, E, ridge):
     return coef, float(np.sqrt(np.mean((pred - E) ** 2))), float(np.sqrt(np.mean(loo ** 2)))
 
 
-def pair_interactions(a0, elements=("Cr", "Co", "Ni"), composition=(1, 1, 1), ncell=4,
+def pair_interactions(a0, elements, potential, composition=None, ncell=4,
                       nconfig=240, nshell=4, rounds=2, n_round=96, T_round=(400.0, 2500.0),
-                      batch=24, seed=0, potential=POTENTIAL, ridge=1e-6,
+                      batch=24, seed=0, ridge=1e-6,
                       verbose=True) -> PairInteractions:
     """Relaxed energies of arrangements at fixed lattice constant, fitted to
     pair interactions in the first `nshell` shells.
@@ -346,6 +353,7 @@ def pair_interactions(a0, elements=("Cr", "Co", "Ni"), composition=(1, 1, 1), nc
     of an a-b pair relative to the average of an a-a and a b-b pair, half the
     usual ordering energy w = 2V_ab - V_aa - V_bb."""
     t0 = time.time()
+    composition = _comp(elements, composition)
     pot, cell, pmap, cp = _cell(elements, a0, ncell, potential)
     nsp = len(elements)
     n = cell.natoms
@@ -436,7 +444,7 @@ def warren_cowley_from_nb(sp, nb, nsp):
     return np.array(out)
 
 
-def lattice_mc_alpha(V, T, composition=(1, 1, 1), ncell=8, sweeps=600, nshell_alpha=3,
+def lattice_mc_alpha(V, T, composition=None, ncell=8, sweeps=600, nshell_alpha=3,
                      seed=0, a0=3.56, anneal=300, T_start=3000.0, nsnap=10):
     """Equilibrium Warren-Cowley parameters of the pair-interaction model at
     temperature T by lattice Monte Carlo (swap moves, numba).
@@ -446,6 +454,7 @@ def lattice_mc_alpha(V, T, composition=(1, 1, 1), ncell=8, sweeps=600, nshell_al
     sweeps, then run for `sweeps` more; alpha is averaged over the last half
     of `nsnap` snapshots. Returns (alpha (nshell_alpha, nsp, nsp), last arrangement)."""
     nsp = V.shape[1]
+    composition = np.ones(nsp) if composition is None else composition
     nb = fcc_neighbours(ncell, max(V.shape[0], nshell_alpha), a0)
     sp = random_species(nb[0].shape[0], composition, 1, seed)[0]
     if T < T_start and anneal > 0:

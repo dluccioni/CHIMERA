@@ -1,9 +1,9 @@
 """chi(k) data: the representation that keeps the phase.
 
 What the files hold decides what the fit can see. A |chi(R)| file is the
-magnitude of a Fourier transform whose window, k weight and E0 were chosen by
-the experimenters and are no longer recorded; the phase was discarded with
-them. chi(k) is the signal before any of that happened: real-valued,
+magnitude of a Fourier transform whose window, k weight and E0 were chosen at
+export and are often not recorded; the phase was discarded with them. chi(k)
+is the signal before any of that happened: real-valued,
 dimensionless, one sample every 0.05 A^-1 in the Athena / Larch default. From
 it this module builds COMPLEX chi(R) with a window of our choosing, on the same
 FFT grid the forward model uses, so data and model go through one transform
@@ -13,8 +13,7 @@ Why that matters for the fits
 -----------------------------
 * The phase carries r and E0; the magnitude carries the N sigma^2 S0^2
   product. With the magnitude alone, sigma^2 and the short-range order both
-  just shrink the first-shell peak and the fit cannot tell them apart (the
-  calibration variant sigma x0.85 moved alpha_CrCr from -0.38 to -0.15). With
+  just shrink the first-shell peak and the fit cannot tell them apart. With
   the phase, dE0 and the distances are pinned per edge and the amplitude
   channel is free to constrain sigma^2 on its own.
 * The magnitude throws away roughly half the independent points
@@ -111,9 +110,8 @@ def window_for_edge(window, e):
     `kmin`/`kmax` may be one number for every edge, or one PER EDGE. Per-edge
     limits matter when the edges were measured over different energy ranges:
     a single window has to fit inside the narrowest of them, which throws away
-    whatever the others measured beyond it. Here Co stops at 11.3 A^-1 while Cr
-    reaches 13.65 and Ni 13.15, so a common window costs those two about a
-    quarter of their range - and the transform is per-edge already.
+    whatever the others measured beyond it, and the transform is per-edge
+    already.
     """
     w = make_window(window)
     lo = np.atleast_1d(w.kmin); hi = np.atleast_1d(w.kmax)
@@ -160,8 +158,8 @@ class ChiK:
 
     `k` is one array shared by all edges or a sequence of per-edge arrays;
     `chi` is (nsp, nk) or a sequence of per-edge arrays (lengths may differ
-    between edges, since each edge has its own energy range). Rows are ordered
-    like `exafs_gpu.scattering.ELEMENTS`, the same as the model's absorbers.
+    between edges, since each edge has its own energy range). Rows are in the
+    system's element order, the same as the model's absorbers.
     """
 
     def __init__(self, k, chi, elements=None):

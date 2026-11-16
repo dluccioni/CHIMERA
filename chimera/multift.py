@@ -1,7 +1,7 @@
 """A Fourier transform that carries one k axis per edge, and one channel per
 (edge, k weight).
 
-The fitted E0 differs between the Cr, Co and Ni edges, so each edge's chi(k)
+The fitted E0 differs from edge to edge, so each edge's chi(k)
 has to be transformed against its own experimental k axis. When several k
 weights are fitted at once each (edge, k weight) pair is a separate output
 channel, ordered edge-major; `chan_edge` says which edge a channel belongs to

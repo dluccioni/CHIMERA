@@ -2,16 +2,10 @@
 # removes them from every commit when it builds main from development.
 # A line ending in "/" is a directory; any other line is a shell-style
 # pattern matched against the whole path.
+#
+# main is the general codebase. Anything tied to one dataset - the drivers,
+# analyses and figure scripts for a particular measurement, its staging
+# maps - lives in scripts/ or data_maps/ and stays here, as do the tests.
 tests/
-scripts/test_*.py
-
-# figure scripts that import from the scripts/test_*.py investigations
-scripts/make_error_budget_figure.py
-scripts/make_freshlook_summary.py
-scripts/plot_extra_term.py
-scripts/plot_k_noise.py
-scripts/plot_outlier_positions.py
-scripts/plot_peak_fits.py
-scripts/plot_recommended.py
-scripts/plot_s02_fits.py
-scripts/plot_static_fits.py
+scripts/
+data_maps/

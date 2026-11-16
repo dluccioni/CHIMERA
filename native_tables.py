@@ -4,9 +4,12 @@ The native counterpart of feff8l_tables.py: same arguments, same cluster,
 same output format (feffNNNN.dat + meta.json in data/<name>/), but no FEFF
 binaries and no larch. See exafs_gpu/abinitio/ for the physics.
 
-    python native_tables.py --elements Cr Co Ni --d-nn 2.517 --name crconi_fcc2517_native
-    python native_tables.py --elements Cr Co Ni --d-nn 2.517 \\
-        --name crconi_fcc2517_native_ms --rpath 5.3 --nleg 4
+    python native_tables.py --elements Fe Ni --d-nn 2.538 --name feni_fcc2538_native
+    python native_tables.py --elements Fe Ni --d-nn 2.538 \\
+        --name feni_fcc2538_native_ms --rpath 5.3 --nleg 4
+
+Fits do not need these files: `--tables native` computes the same paths
+in-process. Write them to inspect the paths or to use them elsewhere.
 """
 import os
 import sys

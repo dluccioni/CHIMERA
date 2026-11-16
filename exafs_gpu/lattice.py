@@ -1,10 +1,12 @@
-"""FCC supercell, fixed-topology neighbour lists, and a harmonic thermal model.
+"""Supercells (sc, bcc, fcc, hcp), fixed-topology neighbour lists, and a
+harmonic thermal model.
 
 Two design choices that matter:
 
 1. The neighbour LIST is built once from the ideal lattice and never rebuilt.
-   The structure is constrained to remain FCC and displacements stay well below
-   half the NN spacing, so pair topology is invariant. Only distances change.
+   The structure is constrained to stay on its lattice and displacements stay
+   well below half the NN spacing, so pair topology is invariant. Only
+   distances change.
    This makes both the forward model and the MC delta-updates much cheaper.
 
 2. Thermal displacements are drawn from a harmonic lattice-dynamics covariance,
@@ -16,7 +18,6 @@ Two design choices that matter:
 """
 from __future__ import annotations
 import numpy as np
-from .scattering import ELEMENTS, NSP
 
 KB = 8.617333262e-5  # eV/K
 
@@ -133,7 +134,7 @@ class ThermalSampler:
 
 
 def static_relaxation(cell, species, i_idx, j_idx, shift,
-                      k_bond=2.6, n_iter=400, step=0.08, elements=None):
+                      k_bond=2.6, n_iter=400, step=0.08, elements=()):
     """Relax atoms against species-dependent NN equilibrium bond lengths.
 
     This is the size-mismatch distortion: the part of the displacement field that
@@ -146,7 +147,9 @@ def static_relaxation(cell, species, i_idx, j_idx, shift,
     nn = _nn_cut(cell)
     m = r0 <= nn
     ii, jj, sh = i_idx[m], j_idx[m], shift[m]
-    els = elements if elements is not None else ELEMENTS
+    els = tuple(elements)
+    if len(els) <= int(species.max()):
+        raise ValueError("static_relaxation needs elements= for every species index")
     req = np.array([[METALLIC_RADIUS[a] + METALLIC_RADIUS[b] for b in els]
                     for a in els])
     target = req[species[ii], species[jj]]
@@ -187,12 +190,9 @@ def wc_vector(alpha):
     return alpha[np.triu_indices(alpha.shape[0])]
 
 
-def wc_labels(elements=None):
-    els = elements if elements is not None else ELEMENTS
+def wc_labels(elements):
+    els = tuple(elements)
     return [f"a_{els[i]}{els[j]}" for i, j in zip(*np.triu_indices(len(els)))]
-
-
-WC_LABELS = wc_labels()          # default CrCoNi labels, kept for existing code
 
 
 # ===========================================================================

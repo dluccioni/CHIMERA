@@ -109,7 +109,7 @@ class ShellModel:
     """chi(k) and |chi(R)| from pair counts, with cheap parameter updates."""
 
     def __init__(self, k_phys, tables, shells_ref, shell_mult, sigma2_shell_ref,
-                 natoms, a0_ref=3.566, ms_paths=None, s02=1.0, dk_win=1.0,
+                 natoms, a0_ref, ms_paths=None, s02=1.0, dk_win=1.0,
                  pairs=None, composition=None, elements=None, system=None):
         self.k = np.asarray(k_phys, float)
         _, f, delta, lam = tables.as_float64()
@@ -469,8 +469,8 @@ def crlb(model, N, data, sigma, mask, idx, shells=None, alpha_shell=0,
     profiled out exactly as in the fit. `data` may be the array or a ChiK.
 
     The nuisances matter: the bond offsets dr and the per-edge E0 can mimic
-    part of a short-range-order signal (a Cr-avoiding arrangement shortens
-    the mean Cr-X bond just as a Cr-X offset would), and the closed-loop test
+    part of a short-range-order signal (an arrangement in which A avoids A
+    shortens the mean A-X bond just as an A-X offset would), and the closed-loop test
     shows a random-alloy calibration absorbing order that way. The default
     list therefore includes everything the calibration fits that the RMC
     could trade against: a0, the sigma^2 scale, the MS amplitude, dE0 per
@@ -583,12 +583,11 @@ def crlb(model, N, data, sigma, mask, idx, shells=None, alpha_shell=0,
                 shells=[int(s) + 1 for s in shells],
                 nuisance=list(nuisance or ()), n_sro_directions=int(nsro),
                 eig_sd=eig_sd.tolist(), columns=names,
-                # the FULL 6x6 posterior covariance of the alpha_shell vector,
-                # not just its diagonal. The diagonal answers "how well is
-                # alpha_CrCr known"; the eigenvectors answer the more useful
-                # question of which COMBINATIONS the data determines, which for
-                # three nearly identical backscatterers is where the
-                # information actually lives (see scripts/alpha_modes.py).
+                # the FULL posterior covariance of the alpha_shell vector, not
+                # just its diagonal. The diagonal answers "how well is alpha_AA
+                # known"; the eigenvectors answer the more useful question of
+                # which COMBINATIONS the data determines, which for nearly
+                # identical backscatterers is where the information lives.
                 alpha_cov=cov_alpha.tolist(),
                 nuisance_sd={k: (v[0] if len(v) == 1 else v) for k, v in nuis_sd.items()},
                 dr_entry_sd=dr_entry_sd)

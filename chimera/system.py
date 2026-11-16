@@ -1,21 +1,24 @@
 """The alloy being fitted: elements, composition, lattice, reference cell, tables.
 
-Everything that used to be a CrCoNi constant scattered over the package -
-`ELEMENTS`, `Z_OF`, the 3.566 A reference cell, the `crconi_fcc2517` table
-names, the 2.517 A spacing the multiple-scattering paths were computed for -
-lives here as one value object. The model, the pair-count model, the
-calibration and the fit driver all take an `AlloySystem` (or build the
-default one), derive the species count from it, and write it into every
-calibration and fit record so a results tree says what it was fitted as.
+One value object holds everything the model needs to know about the sample:
+the absorbing elements (in model order), their atomic fractions, the
+lattice, the reference lattice constant the supercell is built at, and the
+names of the scattering-table sets. The model, the pair-count model, the
+calibration and the fit driver all take an `AlloySystem`, derive the
+species count from it, and write it into every calibration and fit record
+so a results tree says what it was fitted as.
 
-The default remains equiatomic fcc CrCoNi, so code that never mentions a
-system behaves exactly as before.
+There is no built-in alloy. Name one explicitly:
 
-Retargeting to another alloy:
-
-    sys = AlloySystem.from_tables("feni_bcc2482", ms_name=None,
-                                  composition=(0.5, 0.5))
+    sys = AlloySystem(elements=("Fe", "Ni"), lattice="fcc", a0_ref=3.59,
+                      tables_name="native", ms_name="native")
+    sys = AlloySystem.from_tables("feni_fcc2538", ms_name="feni_fcc2538_ms")
     S = Spectrum(system=sys)
+
+or set it once for a session, after which calls that are not given a
+system use it:
+
+    set_default(sys)
 
 `from_tables` reads `data/<name>/meta.json`, which `feff8l_tables.py` writes:
 the elements, the nearest-neighbour spacing of the FEFF cluster and (new) the
@@ -39,7 +42,7 @@ import os, json
 from dataclasses import dataclass, replace
 import numpy as np
 
-from exafs_gpu.scattering import Z_TABLE, ELEMENTS as _DEFAULT_ELEMENTS, is_native
+from exafs_gpu.scattering import Z_TABLE, is_native
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(_ROOT, "data")
@@ -66,7 +69,7 @@ def read_meta(name):
 
 def pair_labels(elements, sep=""):
     """Unordered pair labels in the (a <= b) order the code uses everywhere:
-    CrCr, CrCo, CrNi, CoCo, CoNi, NiNi for CrCoNi."""
+    for elements (A, B, C): AA, AB, AC, BB, BC, CC."""
     els = tuple(elements)
     return [f"{els[a]}{sep}{els[b]}" for a, b in zip(*np.triu_indices(len(els)))]
 
@@ -99,10 +102,9 @@ class AlloySystem:
     name: str = None
     # How the data's k (measured from the edge) maps onto the model's internal
     # momentum p. "constant": p^2 = k^2 + ETOK dE0 with one dE0 per edge, which
-    # then has to carry the whole inner potential (CHIMERA up to 2026-11-09).
-    # "table": through the scattering calculation's own k(p), whose gap falls
-    # from ~15 to ~6 eV over the fit range; dE0 is then only the offset between
-    # the experimenter's E0 and the calculation's Fermi level.
+    # then has to carry the whole inner potential. "table": through the
+    # scattering calculation's own energy-dependent k(p); dE0 is then only the
+    # offset between the experimenter's E0 and the calculation's Fermi level.
     k_axis: str = "constant"
 
     def __post_init__(self):
@@ -165,7 +167,7 @@ class AlloySystem:
     @classmethod
     def from_dict(cls, d):
         if d is None:
-            return DEFAULT
+            return _require_default("no system recorded")
         return cls(elements=tuple(d["elements"]), composition=d.get("composition"),
                    lattice=d.get("lattice", "fcc"), a0_ref=d.get("a0_ref"),
                    tables_name=d.get("tables_name"), ms_name=d.get("ms_name"),
@@ -200,59 +202,85 @@ class AlloySystem:
                    tables_name=name, ms_name=ms_name, c_over_a=ca, name=system_name)
 
 
-DEFAULT = AlloySystem(elements=_DEFAULT_ELEMENTS, lattice="fcc", a0_ref=3.566,
-                      tables_name="crconi_fcc2517", ms_name="crconi_fcc2517_ms",
-                      name="CrCoNi")
+_default = None
+
+
+def set_default(system):
+    """Make `system` (anything `resolve` accepts, or None to clear it) the
+    alloy used by every call that is not given one. Returns it."""
+    global _default
+    _default = None if system is None else resolve(system)
+    return _default
+
+
+def get_default():
+    """The session default set with `set_default`, or None."""
+    return _default
+
+
+def _require_default(why):
+    if _default is None:
+        raise ValueError(
+            f"{why}, and no default alloy is set: pass system= (an AlloySystem, "
+            f"a table-set name or a calibration record), or elements= with "
+            f"a0_ref=, or call chimera.system.set_default(...) once")
+    return _default
+
+
+def _from_overrides(kind, ch):
+    """An AlloySystem from keyword fields alone (no base system)."""
+    if not ch.get("elements"):
+        return _require_default("no elements given")
+    if ch.get("a0_ref") is None:
+        raise ValueError(f"{kind}: the reference lattice constant is needed "
+                         f"(a0_ref=, or --a0-ref on the command line)")
+    return AlloySystem(**ch)
 
 
 def resolve(system=None, **overrides):
-    """An AlloySystem from `system` (an AlloySystem, a dict, a table-set name
-    or None for the default) with any non-None keyword overrides applied."""
+    """An AlloySystem from `system` (an AlloySystem, a dict, a table-set name,
+    "analytic", "native[:recipe]", or None) with any non-None keyword
+    overrides applied. With None the session default (`set_default`) is the
+    base; without one, the overrides must describe the alloy."""
+    ch = {k: v for k, v in overrides.items() if v is not None}
+    if "elements" in ch:
+        ch["elements"] = tuple(ch["elements"])
+    if isinstance(system, str) and (system == "analytic" or is_native(system)):
+        # the stand-in tables, or paths computed in-process: no directory and
+        # no meta.json, so the alloy comes from the overrides (or the default)
+        fields = dict(tables_name=system,
+                      ms_name=None if system == "analytic" else system)
+        base = _default
+        if base is not None and ch.get("elements", base.elements) == base.elements:
+            return base.replace(**{**fields, **ch})
+        return _from_overrides(system, {**fields, **ch})
     if system is None:
-        base = DEFAULT
+        if _default is None:
+            return _from_overrides("no system named", ch)
+        base = _default
+        if "elements" in ch and ch["elements"] != base.elements:
+            # a different element list: nothing sensible to inherit from the
+            # default's table names, name or composition
+            for k in ("tables_name", "ms_name", "name", "composition"):
+                ch.setdefault(k, None)
     elif isinstance(system, AlloySystem):
         base = system
     elif isinstance(system, dict):
         base = AlloySystem.from_dict(system)
-    elif isinstance(system, str) and system == "analytic":
-        els = overrides.get("elements") or DEFAULT.elements
-        base = AlloySystem(elements=els, composition=overrides.get("composition"),
-                           lattice=overrides.get("lattice") or "fcc",
-                           a0_ref=overrides.get("a0_ref") or (DEFAULT.a0_ref if tuple(els) == DEFAULT.elements else None),
-                           tables_name="analytic", ms_name=None,
-                           c_over_a=overrides.get("c_over_a"), name=overrides.get("name"))
-    elif is_native(system):
-        # paths computed in-process for this system: no directory, no meta.json
-        els = tuple(overrides.get("elements") or DEFAULT.elements)
-        a0 = overrides.get("a0_ref") or (DEFAULT.a0_ref if els == DEFAULT.elements else None)
-        if a0 is None:
-            raise ValueError("native tables are computed at the reference cell: pass a0_ref "
-                             "(--a0-ref) for an alloy other than the default")
-        base = AlloySystem(elements=els, composition=overrides.get("composition"),
-                           lattice=overrides.get("lattice") or "fcc", a0_ref=a0,
-                           tables_name=system, ms_name=system,
-                           c_over_a=overrides.get("c_over_a"), name=overrides.get("name"))
     elif isinstance(system, str):
         base = AlloySystem.from_tables(system)
     else:
         raise TypeError(f"cannot make an AlloySystem from {type(system).__name__}")
-    ch = {k: v for k, v in overrides.items() if v is not None}
-    if "elements" in ch and base is DEFAULT and tuple(ch["elements"]) != DEFAULT.elements:
-        # a different element list with no tables named: there is nothing
-        # sensible to inherit from the CrCoNi default
-        ch.setdefault("tables_name", None); ch.setdefault("ms_name", None)
-        ch.setdefault("name", None)
-        if "composition" not in ch:
-            ch["composition"] = None
     return base.replace(**ch) if ch else base
 
 
 def system_of_tree(out):
     """The AlloySystem a results tree was fitted as, from its calibration.json
-    (top level, or inside the shared record); the default for older trees."""
+    (top level, or inside the shared record). A tree that records none falls
+    back to the session default."""
     p = os.path.join(out, "calibration.json")
     if not os.path.exists(p):
-        return DEFAULT
+        return _require_default(f"{out} has no calibration.json")
     c = json.load(open(p))
     d = c.get("system")
     if d is None:
@@ -261,4 +289,4 @@ def system_of_tree(out):
             d = cal[k].get("system") or cal[k].get("shared", {}).get("system")
             if d:
                 break
-    return AlloySystem.from_dict(d) if d else DEFAULT
+    return AlloySystem.from_dict(d) if d else _require_default(f"{p} records no system")

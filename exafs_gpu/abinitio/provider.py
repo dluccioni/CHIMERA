@@ -15,14 +15,15 @@ through the same column conversion (`scattering.columns_to_record`). A fit on
 in-process paths and a fit on files written from the same calculation
 therefore get the same numbers, and no FEFF or FEFF-format file is involved.
 
-The calculation takes ~15 s for CrCoNi with 4-leg paths to 5.3 A, so
-results are cached in memory and in data/_cache (or $CHIMERA_CACHE), keyed
-on the alloy, the reference spacing, the recipe and ENGINE_VERSION. Bump
-ENGINE_VERSION whenever a change to the engine moves the numbers.
+The calculation takes seconds to tens of seconds for a ternary with 4-leg
+paths to 5.3 A, so results are cached in memory and in data/_cache (or
+$CHIMERA_CACHE), keyed on the alloy, the reference spacing, the recipe and
+ENGINE_VERSION. Bump ENGINE_VERSION whenever a change to the engine moves
+the numbers.
 
-    recs = path_records(("Cr", "Co", "Ni"), (1/3, 1/3, 1/3), "fcc", 2.5215)
+    recs = path_records(("Fe", "Ni"), (0.5, 0.5), "fcc", 2.538)
     tables = recs.ss_tables(k_grid, s02=1.0)
-    ms = recs.ms["Cr"]                      # path records, 3+ legs
+    ms = recs.ms["Fe"]                      # path records, 3+ legs
 
 The physics is chosen in the recipe; the defaults are the original engine
 (overlapped non-relativistic atoms, Hedin-Lundqvist self-energy). The most

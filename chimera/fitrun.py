@@ -6,14 +6,13 @@ the data actually says about them:
 
   determined      a0 (hence the nearest-neighbour distance), sigma^2, the
                   per-edge amplitude, and the fit quality. The first-shell
-                  peak alone fixes these; the ideal-model R-factor over
-                  1.8-2.6 A is 0.002.
-  NOT determined  the Warren-Cowley parameters. Perturbing the calibration
-                  within its own uncertainty (sigma^2 by 15%, k weight 2 vs 3,
-                  the fit range by 0.2 A) moves a_CrCr over the whole range
-                  -0.19 to +0.38 while the R-factor moves by under 8%. The
-                  fitted values are therefore reported together with that
-                  systematic band, which is what `systematic_band` measures.
+                  peak alone fixes these.
+  often NOT       the Warren-Cowley parameters. Perturbing the calibration
+  determined      within its own uncertainty (sigma^2, k weight, the fit
+                  range) can move alpha by more than its statistical error
+                  while the R-factor barely changes. The fitted values are
+                  therefore reported together with that systematic band,
+                  which is what `systematic_band` measures.
 
 Every fit also reports the Cramer-Rao bound on each alpha (`wc_crlb`): the
 1-sigma uncertainty the data permit at the residual level the sampler sees,
@@ -22,10 +21,10 @@ parameters free (shellmodel.crlb). It is independent of the sampler and of
 how many steps were run; a bound above `CRLB_THRESHOLD` marks the value as
 not determined, however small the seed-to-seed scatter is.
 
-Moves are species swaps only (`swap_frac=1.0`): the atoms stay on ideal FCC
-sites and all displacement disorder is carried by the Debye-Waller factor.
-That is what "keep the sample FCC" means operationally, and it also avoids
-fitting 1500 coordinates to ~54 independent data points.
+Moves are species swaps only (`swap_frac=1.0`): the atoms stay on ideal
+lattice sites and all displacement disorder is carried by the Debye-Waller
+factor. That keeps the sample on its lattice by construction, and it avoids
+fitting thousands of coordinates to a few dozen independent data points.
 
 `data` may be a |chi(R)| array on `R_data` or a `chik.ChiK` (measured
 chi(k)). In the second case the target is the COMPLEX chi(R) obtained with
@@ -41,7 +40,6 @@ from scipy import stats
 from scipy.optimize import minimize, least_squares
 
 from exafs_gpu.lattice import warren_cowley
-from exafs_gpu.scattering import ELEMENTS, NSP
 from methods.method_a_rmc import RMCSampler
 from . import dataio as io
 from . import model as M
@@ -51,10 +49,6 @@ from .system import wc_labels
 from .calibrate import mean_zero
 
 CRLB_THRESHOLD = 0.3
-
-# the default system's labels; `wc_labels(S.elements)` for any other
-WC_LABELS = wc_labels(ELEMENTS)
-WC_LABELS_TEX = wc_labels(ELEMENTS, tex=True)
 
 
 def refine_local(S, cfg, idx, data, mask_d, a0_guess, sig_guess,
@@ -135,10 +129,10 @@ def joint_nuisance_fit(S, cfg, data, idx, mask_d, a0_guess, sig_guess,
 
     Why: refining the nuisances on the random configuration and then holding
     them is a profile at alpha = 0. Along the (sigma^2, E0, alpha) valley the
-    cost changes by under 1% while alpha(Cr-Cr) moves by 0.04-0.05, so where
+    cost can be nearly flat while alpha moves by several hundredths, so where
     the nuisances are held decides alpha. Fitting them together is the
     defensible choice, and the sampler then finds the configuration at those
-    values (measured to land within 0.003 of the continuous alpha).
+    values.
     Coordinate descent - refine on the best configuration, re-sample - was
     tried first and stalls in that valley, and the unweighted R-factor it
     minimised is dominated by the k^3 channels besides.
@@ -251,11 +245,9 @@ def fit_one(S, R_data, data, idx, mask_d, a0_guess, sig_guess, seeds=(0, 1),
                     per-edge E0 shifts JOINTLY with the first-shell order on
                     the pair-count model (`joint_nuisance_fit`; a0 stays at
                     its random-configuration value) and sample at those
-                    values. Off -
-                    the default, and the behaviour before 2026-09-26 - the
-                    nuisances stay where the random configuration put them,
-                    which is a profile at alpha = 0; on this data that alone
-                    moves alpha by 0.04-0.05 (testing/MODEL_CHANGES.md item 10).
+                    values. Off (the default here; the command-line driver
+                    turns it on), the nuisances stay where the random
+                    configuration put them, which is a profile at alpha = 0.
     `free_dE0`      let the refinement move the per-edge E0 (mean-zero, so
                     the common E0 stays at the calibration)
     """
@@ -343,10 +335,9 @@ def fit_one(S, R_data, data, idx, mask_d, a0_guess, sig_guess, seeds=(0, 1),
     joint_info = None
     if joint and refine and (free_sigma or free_dE0):
         # a0 stays where the random-configuration refinement put it. Along
-        # the a0 / E0 / alpha ridge the cost changes by under 1% for a 2 mA
-        # shift in a0 and 0.08 in alpha(Cr-Cr) (measured 2026-09-26: freeing
-        # a0 here took alpha(Cr-Cr) from -0.03 to -0.11 for +0.002 A), so a
-        # free a0 would make the answer a point on the ridge, not a fit.
+        # the a0 / E0 / alpha ridge a few mA of a0 trade against a large
+        # change of alpha at almost no cost, so a free a0 would make the
+        # answer a point on the ridge, not a fit.
         a0, ss, dE0j, wc_ls, cost = joint_nuisance_fit(
             S, cfg0, data, idx, mask_d, a0, ss, False, free_sigma, free_dE0)
         joint_info = dict(a0=float(a0), sigma_scale=float(ss),
@@ -482,16 +473,14 @@ CALIB_VARIANTS = [
     ("sigma x1.15", dict(fsig=1.15)),
     ("k weight 2", dict(kweight=2)),
     ("k weight 4", dict(kweight=4)),
-    ("k min +0.5", dict(kmin=3.5)),
-    # relative, so it probes the window whether production runs one k range or
-    # one per edge. It used to name 12.0 absolutely, which on a 10.5 window
-    # WIDENED past where Co's data stops - that variant scored 3-4x worse than
-    # baseline at every pressure and was rejected as inadmissible, so it was
-    # contributing nothing to the systematic band.
+    # window and range probes are relative to the calibration's own values, so
+    # they are the same perturbation for any system and for a per-edge k
+    # window, and a shortened window always stays inside the data
+    ("k min +0.5", dict(dkmin=+0.5)),
     ("k max -1.0", dict(dkmax=-1.0)),
-    ("R 1.5-5.0", dict(rmin=1.5)),
-    ("R 1.4-4.6", dict(rmax=4.6)),
-    ("R 1.4-5.2", dict(rmax=5.2)),
+    ("R min +0.1", dict(drmin=+0.1)),
+    ("R max -0.4", dict(drmax=-0.4)),
+    ("R max +0.2", dict(drmax=+0.2)),
     ("ms_amp x0.85", dict(fms=0.85)),
     ("ms_amp x1.15", dict(fms=1.15)),
     ("no dr", dict(dr_off=True)),
@@ -508,8 +497,8 @@ def band_from_variants(rows, tol=1.3):
 
     A variant that changes the SET of k weights is not comparable at all: it
     fits a different number of channels, weighted differently, so its
-    R-factor is on another scale (on the CrCoNi chi(k) data k^4 alone scored
-    half the k^1,2,3 baseline). Those are reported but excluded.
+    R-factor is on another scale (a single high k weight can score far below
+    a k^1,2,3 baseline). Those are reported but excluded.
 
     Among the comparable ones, "cannot reject" is measured against the
     BASELINE - the fit actually being reported - not against the best variant.
@@ -571,15 +560,17 @@ def hamilton_ratio(n_ind, n_var, p=1, alpha=0.05, floor=1.05):
     return max(crit, float(floor))
 
 
-def parameter_1sigma(rows, key, conf=0.317, n_ind=68.0, n_var=11.0):
+def parameter_1sigma(rows, key, n_ind, n_var, conf=0.317):
     """The 1-sigma half-width of one nuisance parameter, from the curvature of
     R against it.
 
     The +/- probes give three points (minus, baseline, plus). A parabola
     through them has a minimum and a curvature, and the R-ratio test converts
-    that curvature into a confidence interval. This replaces the probe size -
-    which is arbitrary, and on the 2026-09-16 data was 4x wider than the data
-    supports for a0 - with the interval the measurement actually allows.
+    that curvature into a confidence interval. This replaces the probe size,
+    which is arbitrary and can be several times wider than the data supports,
+    with the interval the measurement actually allows. `n_ind` is the number
+    of independent points (a fit record's `n_independent`), `n_var` the
+    number of fitted parameters.
     """
     by = {r["variant"]: r for r in rows}
     (nm_lo, x_lo), (nm_hi, x_hi) = PAIRED_VARIANTS[key]
@@ -604,14 +595,14 @@ def parameter_1sigma(rows, key, conf=0.317, n_ind=68.0, n_var=11.0):
                 probe=float(x_hi), scale=half / abs(x_hi))
 
 
-def band_calibrated(rows, n_ind=68.0, n_var=11.0, alpha=0.05, conf=0.317,
+def band_calibrated(rows, n_ind, n_var, alpha=0.05, conf=0.317,
                     floor=1.05, max_scale=1.0):
     """Systematic band with both of the fixes described in the module notes.
 
     1. A paired variant is rescaled to the 1-sigma range of its own parameter.
-       The +-0.005 A probe on a0 produced HALF the whole band on the 2026-09-16
-       data while the data pins a0 to +-0.0012 A, so the probe was reporting a
-       lattice constant the measurement had already excluded.
+       A fixed probe (say +-0.005 A on a0) can dominate the band while the
+       data pins the parameter far more tightly, in which case the probe
+       reports a value the measurement has already excluded.
     2. Unpaired variants - the ones that are genuine alternative choices rather
        than a perturbation, like dropping dr or moving the R range - are
        admitted by `hamilton_ratio` instead of an arbitrary R-factor ratio.
@@ -629,7 +620,7 @@ def band_calibrated(rows, n_ind=68.0, n_var=11.0, alpha=0.05, conf=0.317,
     paired = {nm: key for key, pr in PAIRED_VARIANTS.items() for nm, _ in pr}
     scales, dev, used, dropped = {}, [], [], []
     for key in PAIRED_VARIANTS:
-        got = parameter_1sigma(rows, key, conf=conf, n_ind=n_ind, n_var=n_var)
+        got = parameter_1sigma(rows, key, n_ind, n_var, conf=conf)
         scales[key] = min(got["scale"], max_scale) if got else max_scale
     for i, r in enumerate(rows):
         if i == 0 or not comparable[i]:
@@ -652,8 +643,7 @@ def band_calibrated(rows, n_ind=68.0, n_var=11.0, alpha=0.05, conf=0.317,
                 wc_half_width=(0.5 * (hi - lo)).tolist(),
                 hamilton_threshold=float(thr),
                 parameter_scales={k: float(v) for k, v in scales.items()},
-                parameter_1sigma={k: (parameter_1sigma(rows, k, conf=conf,
-                                                       n_ind=n_ind, n_var=n_var)
+                parameter_1sigma={k: (parameter_1sigma(rows, k, n_ind, n_var, conf=conf)
                                       or {}) for k in PAIRED_VARIANTS},
                 admissible=used, rejected=dropped,
                 n_used=len(dev), n_variants=len(rows))
@@ -682,6 +672,9 @@ def systematic_band(R_data, data, cal, seeds=(0,), nsteps=6000, nrep=48,
         ms_amp = cal.get("ms_amp", 1.0) * ch.get("fms", 1.0)
         kw = ch.get("kweight", cal["kweight"])
         kmin = ch.get("kmin", cal["kmin"]); kmax = cal["kmax"]
+        if "dkmin" in ch:
+            kmin = (kmin + ch["dkmin"] if np.isscalar(kmin)
+                    else np.asarray(kmin, float) + ch["dkmin"])
         if "kmax" in ch:
             # A variant names one number, but production may run a per-edge
             # window sitting at each edge's own data limit. Taking the number
@@ -694,7 +687,8 @@ def systematic_band(R_data, data, cal, seeds=(0,), nsteps=6000, nrep=48,
             # one number or one per edge, and always lands inside the data
             kmax = (kmax + ch["dkmax"] if np.isscalar(kmax)
                     else np.asarray(kmax, float) + ch["dkmax"])
-        rmin = ch.get("rmin", cal["rmin"]); rmax = ch.get("rmax", cal["rmax"])
+        rmin = ch.get("rmin", cal["rmin"]) + ch.get("drmin", 0.0)
+        rmax = ch.get("rmax", cal["rmax"]) + ch.get("drmax", 0.0)
         ov = dict(a0=a0, dE0=dE0, kmin=kmin, kmax=kmax, kweight=kw,
                   sigma_scale=ss, ms_amp=ms_amp)
         if ch.get("dr_off"):

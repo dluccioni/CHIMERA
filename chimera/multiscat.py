@@ -6,14 +6,14 @@ native_tables.py output) or straight from the in-process native engine
 
 Why it is needed
 ----------------
-In fcc, twice the nearest-neighbour distance equals the fourth-shell radius to
-one part in 5000 (2 x 2.5221 = 5.0443 A against 5.0430 A). The collinear path
-absorber -> nearest neighbour -> fourth-shell atom therefore lands exactly on
-top of the fourth-shell single-scattering peak, and it is forward-focused: the
-intervening atom scatters through zero degrees, where |f| is an order of
-magnitude larger than at 180 degrees. A single-scattering model is not merely
-imprecise there, it is missing most of the amplitude - measured as an
-R-factor of 0.40 over 4.2-4.8 A while the data is still 25x the noise.
+In fcc the fourth-shell radius is exactly twice the nearest-neighbour
+distance (a sqrt(2) = 2 a / sqrt(2)). The collinear path absorber -> nearest
+neighbour -> fourth-shell atom therefore lands on top of the fourth-shell
+single-scattering peak, and it is forward-focused: the intervening atom
+scatters through zero degrees, where |f| is an order of magnitude larger than
+at 180 degrees. A single-scattering model is not merely imprecise there, it
+is missing most of the amplitude. bcc and hcp have collinear paths of their
+own at other shells.
 
 What is implemented
 -------------------
@@ -36,8 +36,10 @@ configuration-dependent, because the fourth-shell SINGLE scattering stays in
 the pair sum where it always was; what is frozen is only the focusing
 correction on top of it. That is the standard treatment (fixed MS paths
 sharing the single-scattering S02 and E0), and it is justified here because
-the intervening atom enters through forward scattering, where Cr, Co and Ni
-differ by a few percent - far less than they differ at 180 degrees.
+the intervening atom enters through forward scattering, where neighbouring
+elements differ by a few percent - far less than they differ at 180 degrees.
+(`chimera/mslibrary.py` removes the approximation: the exact sum over each
+configuration's own paths.)
 
 Two parameters are fitted: an amplitude for the whole MS term, and the
 Debye-Waller scale c_ms in sigma^2_path = c_ms sigma^2_NN reff / (2 r_NN).
@@ -46,12 +48,11 @@ from __future__ import annotations
 import os, glob
 import numpy as np
 
-from exafs_gpu.scattering import read_feffdat, ELEMENTS, tables_root, _meta
+from exafs_gpu.scattering import read_feffdat, tables_root, _meta
 
 _ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                      "data")
-D_NN_FEFF = 2.517          # the CrCoNi cluster the shipped paths were computed
-                           # for; a set's own meta.json overrides it
+
 
 
 def _read_path(fn):
@@ -61,17 +62,20 @@ def _read_path(fn):
 class MSPaths:
     """FEFF8L multiple-scattering paths for each absorber."""
 
-    def __init__(self, name="crconi_fcc2517_ms", elements=None, min_leg=3,
-                 rmax=None):
+    def __init__(self, name, elements=None, min_leg=3, rmax=None):
         root = tables_root(name)
         meta = _meta(root)
         if elements is None:
-            elements = meta.get("elements") or ELEMENTS
+            elements = meta.get("elements")
+        if not elements or "d_nn" not in meta:
+            raise FileNotFoundError(f"{root}: no meta.json with the elements and d_nn "
+                                    f"the paths were computed for (feff8l_tables.py "
+                                    f"and native_tables.py write it)")
         self.elements = tuple(elements)
         self.name = name
         # the nearest-neighbour spacing of the cluster the paths were computed
         # for: every path length is rescaled from it to the fitted lattice
-        self.d_nn = float(meta.get("d_nn", D_NN_FEFF))
+        self.d_nn = float(meta["d_nn"])
         self.paths = {}
         for a in self.elements:
             folder = os.path.join(root, a)
@@ -145,8 +149,8 @@ class MSPaths:
         """chi_MS(p), shape (nsp, nk), per absorbing atom.
 
         a_scale rescales every path length to the fitted lattice constant
-        (the paths were generated at d_nn = 2.517 A); the tabulated f, delta
-        and lambda are functions of momentum and are left alone.
+        (from the spacing `d_nn` the paths were generated at); the tabulated
+        f, delta and lambda are functions of momentum and are left alone.
         """
         p = np.asarray(k_phys, float)
         out = np.zeros((len(self.elements), p.size))
@@ -168,7 +172,7 @@ class MSPaths:
 _CACHE = {}
 
 
-def get(name="crconi_fcc2517_ms", composition=None, **kw):
+def get(name, composition=None, **kw):
     """The multiple-scattering paths of table set `name`. A path LIBRARY
     (chimera/mslibrary.py, a directory with library.json) gives the exact
     random-alloy expectation at `composition` instead of one cluster's

@@ -11,7 +11,7 @@ physics chosen by `Settings`.
     feff10.write_input(folder, positions, species, s, rpath=6.0, nleg=4)
     feff10.run(folder)
 
-The binaries are found in $FEFF10_BIN, else N:/Applications/JFEFF_FEFF10/feff10/bin.
+The binaries are found in $FEFF10_BIN, else wherever `rdinp` is on the PATH.
 Results are the usual feffNNNN.dat path files, read by
 `exafs_gpu.scattering.read_feffdat`.
 
@@ -30,7 +30,6 @@ import numpy as np
 
 from .scattering import Z_TABLE
 
-BIN_DEFAULT = r"N:\Applications\JFEFF_FEFF10\feff10\bin"
 # the order of feff.bat; modules a card set does not use exit at once
 MODULES = ("rdinp", "dmdw", "atomic", "pot", "ldos", "screen", "crpa", "opconsat",
            "xsph", "fms", "mkgtr", "path", "genfmt", "ff2x", "sfconv", "compton",
@@ -38,9 +37,13 @@ MODULES = ("rdinp", "dmdw", "atomic", "pot", "ldos", "screen", "crpa", "opconsat
 
 
 def bin_dir():
-    d = os.environ.get("FEFF10_BIN", BIN_DEFAULT)
+    d = os.environ.get("FEFF10_BIN")
+    if d is None:
+        exe = shutil.which("rdinp")
+        d = os.path.dirname(exe) if exe else ""
     if not os.path.isfile(os.path.join(d, "rdinp.exe")) and not os.path.isfile(os.path.join(d, "rdinp")):
-        raise FileNotFoundError(f"FEFF10 binaries not found in {d} (set FEFF10_BIN)")
+        raise FileNotFoundError(f"FEFF10 binaries not found{' in ' + d if d else ''}: "
+                                f"set FEFF10_BIN to the directory holding rdinp")
     return d
 
 

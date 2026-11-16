@@ -9,9 +9,8 @@ the path, in path order, equal to `tol`. A sequence and its time reverse
 always contribute the same chi and are grouped too. Shapes are compared up to
 rotation and reflection, which leave the orientation-averaged chi unchanged.
 
-On the 87-atom CrCoNi cluster of the shipped FEFF8L set this reproduces
-FEFF's own path list: 191 groups to 5.3 A with up to four legs, with the
-same degeneracies (tests/test_abinitio_paths.py).
+On an 87-atom fcc alloy cluster this reproduces FEFF8L's own path list to
+5.3 A with up to four legs, with the same degeneracies.
 """
 from __future__ import annotations
 

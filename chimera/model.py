@@ -1,13 +1,13 @@
-"""Forward model for the measured data: configuration -> |chi(R)| on the data grid.
+"""Forward model for the measured data: configuration -> chi(R) on the data grid.
 
 What has to be calibrated, and why
 ----------------------------------
-The files are |chi(R)| only. Everything the experimenters did between mu(E)
-and that magnitude - where they put E0, which k window they transformed, what
-k weight, how the edge step was normalised - is not recorded, and each of
-those changes the R-space result. So they are inferred from the data itself,
-once per pressure, by fitting an ideal FCC model to the location-averaged
-spectra:
+Between mu(E) and chi(R) lie choices that change the R-space result: where
+E0 sits on each edge, the k window and k weight of the transform, the
+edge-step normalisation. With |chi(R)| files none of them is recorded; with
+chi(k) the window and weight are ours but E0 is not. So they are inferred
+from the data itself, per series point, by fitting the ideal-lattice random
+alloy to the position-averaged spectra:
 
     dE0     an error in the threshold energy means the experimental k axis is
             not the physical one: k_exp^2 = k_phys^2 - ETOK * dE0. The model
@@ -30,9 +30,9 @@ spectra:
             optional per-shell multiplier on top, because a single pair of
             force constants does not get every shell's MSRD right.
     dr      nearest-neighbour bond-length offset per pair type (Angstrom,
-            symmetric 3x3, composition-weighted mean zero so it does not
+            symmetric nsp x nsp, composition-weighted mean zero so it does not
             duplicate a0). This is the size-mismatch term: in a random alloy
-            the Cr-Cr, Cr-Ni and Ni-Ni bonds are not the same length, and a
+            the A-A, A-B and B-B bonds are not the same length, and a
             model that puts every first-shell pair at one distance has no way
             to express that except by faking it with the species arrangement.
     C3      third cumulant of the first-shell distance distribution
@@ -81,7 +81,7 @@ import numpy as np
 import cupy as cp
 
 from exafs_gpu.scattering import (feff8l_tables, analytic_transition_metal_tables,
-                                  ScatteringTables, ELEMENTS, NSP, is_native)
+                                  ScatteringTables, is_native)
 from exafs_gpu.lattice import (CrystalSupercell, force_constant_matrix,
                                warren_cowley, pair_vectors)
 from . import system as SYS
@@ -165,7 +165,8 @@ class Spectrum:
                  dr=None, c3=None, system=None, elements=None, composition=None,
                  lattice=None, a0_ref=None, c_over_a=None, tables=None):
         """`system` names the alloy (an AlloySystem, a table-set name, a dict
-        from a calibration record, or None for equiatomic fcc CrCoNi);
+        from a calibration record, or None for the session default set with
+        `chimera.system.set_default`);
         `elements`, `composition`, `lattice`, `a0_ref`, `c_over_a`,
         `tables_name` and `ms_name` override its fields. `tables` is None
         for the set the system names (a FEFF8L or native_tables.py
@@ -213,8 +214,8 @@ class Spectrum:
         elif tables == "analytic" or (tables is None and self.tables_name == "analytic"):
             # the Z-parameterised stand-in, also reachable by naming the
             # table set "analytic" in the system (tests, dry runs)
-            self.tables = analytic_transition_metal_tables(self.k_phys, s02=s02,
-                                                           elements=self.elements)
+            self.tables = analytic_transition_metal_tables(self.k_phys, self.elements,
+                                                           s02=s02)
         elif is_native(self.tables_name):
             # computed in-process by the native engine for this system; no files
             self.tables = native_paths(self.system, self.tables_name).ss_tables(self.k_phys, s02)

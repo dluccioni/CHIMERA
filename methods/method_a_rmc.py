@@ -39,7 +39,6 @@ import cupy as cp
 import time
 
 from exafs_gpu import kernels
-from exafs_gpu.scattering import NSP
 
 _TPB = 256
 _NCAND = 4  # swap-partner candidates drawn per replica per step
@@ -83,7 +82,7 @@ class RMCSampler:
         # ~1500 dimensions is an entropic uphill random walk: chi^2 rose from 3.4
         # to 5.6 over 20k steps. tmin=0.02 makes the cold rung near-greedy.
         self.fm, self.ft = fm, ft
-        self.nsp = int(nsp) if nsp is not None else getattr(fm, "nsp", NSP)
+        self.nsp = int(nsp) if nsp is not None else int(fm.nsp)
         self.nrep = nrep
         # posterior collection and step-size adaptation (see run())
         self.collect_after = collect_after

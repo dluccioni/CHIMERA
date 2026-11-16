@@ -15,8 +15,8 @@ reproduces the native chi exactly:  red = |e^{2 i delta_c}|,
 lambda = 1/Im p, real[p] = Re p, and mag e^{i phase} the rest of the path
 amplitude. k is measured from the Fermi level of the calculation.
 
-    python native_tables.py --elements Cr Co Ni --d-nn 2.517 --name crconi_fcc2517_native
-    python native_tables.py --elements Cr Co Ni --d-nn 2.517 --name crconi_fcc2517_native_ms \\
+    python native_tables.py --elements Fe Ni --d-nn 2.538 --name feni_fcc2538_native
+    python native_tables.py --elements Fe Ni --d-nn 2.538 --name feni_fcc2538_native_ms \\
         --rpath 5.3 --nleg 4
 """
 from __future__ import annotations
@@ -171,13 +171,16 @@ def build_set(name, elements, d_nn, lattice="fcc", composition=None, radius=6.5,
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Native scattering tables (no FEFF needed)")
-    ap.add_argument("--elements", nargs="+", default=["Cr", "Co", "Ni"])
-    ap.add_argument("--composition", type=float, nargs="+", default=None)
+    ap.add_argument("--elements", nargs="+", required=True,
+                    help="absorbing elements, in the order the fit will use")
+    ap.add_argument("--composition", type=float, nargs="+", default=None,
+                    help="atomic fractions in element order (default equiatomic)")
     ap.add_argument("--lattice", default="fcc", choices=["sc", "bcc", "fcc", "hcp"])
     ap.add_argument("--c-over-a", type=float, default=None)
-    ap.add_argument("--d-nn", type=float, default=2.517)
+    ap.add_argument("--d-nn", type=float, required=True,
+                    help="nearest-neighbour distance of the reference cell (A)")
     ap.add_argument("--radius", type=float, default=6.5)
-    ap.add_argument("--name", default="crconi_fcc2517_native")
+    ap.add_argument("--name", required=True, help="the set is written to data/<name>/")
     ap.add_argument("--rpath", type=float, default=None,
                     help="max half-path length (A); default = first shell only")
     ap.add_argument("--nleg", type=int, default=2)

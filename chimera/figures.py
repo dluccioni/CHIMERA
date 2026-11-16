@@ -1,4 +1,4 @@
-"""Comparison figures: measured vs reconstructed |chi(R)|, and the structure."""
+"""Comparison figures: measured vs reconstructed chi(R), and the structure."""
 from __future__ import annotations
 import os
 import numpy as np
@@ -8,12 +8,10 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
-from exafs_gpu.scattering import ELEMENTS
 from .system import wc_labels
+from .dataio import axis_label, point_label
 
-# one colour per unordered pair, diagonal pairs first (the CrCoNi colours
-# are unchanged: Cr-Cr blue, Co-Co vermillion, Ni-Ni green, then the
-# cross pairs)
+# one colour per unordered pair, like pairs first, then the cross pairs
 PAIR_COLOURS = ["#0072B2", "#D55E00", "#009E73", "#56B4E9", "#CC79A7",
                 "#E69F00", "#000000", "#999999", "#8C564B", "#17BECF",
                 "#BCBD22", "#E377C2", "#2CA02C", "#9467BD", "#FF7F0E"]
@@ -46,7 +44,7 @@ plt.rcParams.update({
 def _channel_titles(n, labels, elements=None):
     if labels is not None:
         return list(labels)
-    els = tuple(elements) if elements is not None else ELEMENTS
+    els = tuple(elements) if elements is not None else ()
     if n == len(els):
         return [f"{e} edge" for e in els]
     return [f"channel {i}" for i in range(n)]
@@ -132,7 +130,7 @@ def k_comparison(path, chik, S, species, scales, title, kweight=None, pos=None,
     """
     w = int(S.kweights[0] if kweight is None else kweight)
     n = chik.nsp
-    els = chik.elements or getattr(S, "elements", None) or ELEMENTS
+    els = chik.elements or S.elements
     fig, axes = plt.subplots(1, n, figsize=(2.9 * n, 2.6), squeeze=False,
                              gridspec_kw=dict(wspace=0.28))
     chi_fit = S.chi_k(species, pos)
@@ -171,7 +169,8 @@ def k_comparison(path, chik, S, species, scales, title, kweight=None, pos=None,
 
 def rdf_figure(path, r, g, g_tot, shells, title, wc, wc_band=None, elements=None):
     """Partial RDFs, plus the Warren-Cowley values with their systematic band."""
-    els = tuple(elements) if elements is not None else ELEMENTS
+    els = (tuple(elements) if elements is not None
+           else tuple(f"s{i}" for i in range(np.shape(g)[0])))
     nsp = len(els)
     fig, axes = plt.subplots(1, 2, figsize=(7.4, 2.9),
                              gridspec_kw=dict(width_ratios=[1.55, 1.0], wspace=0.32))
@@ -183,7 +182,7 @@ def rdf_figure(path, r, g, g_tot, shells, title, wc, wc_band=None, elements=None
     for s in shells[:3]:
         ax.axvline(s, color=INK2, lw=0.6, ls=":")
     ax.set_xlabel(r"$r$  (Å)"); ax.set_ylabel(r"$g_{AB}(r)$")
-    ax.set_xlim(1.8, 5.2)
+    ax.set_xlim(r[0], r[-1])
     ax.legend(ncol=2, handlelength=1.6, labelspacing=0.22, columnspacing=1.0,
               borderaxespad=0.3)
     ax.grid(zorder=0); ax.set_axisbelow(True)
@@ -200,7 +199,10 @@ def rdf_figure(path, r, g, g_tot, shells, title, wc, wc_band=None, elements=None
     ax.axvline(0, color=INK2, lw=0.8)
     ax.set_yticks(y); ax.set_yticklabels(labels)
     ax.set_xlabel("Warren–Cowley $\\alpha$ (shell 1)")
-    ax.set_xlim(-0.55, 0.55)
+    lim = max(0.55, 1.1 * float(np.max(np.abs(wc))))
+    if wc_band is not None:
+        lim = max(lim, 1.1 * float(np.max(np.abs(np.asarray(wc_band)))))
+    ax.set_xlim(-lim, lim)
     ax.grid(axis="x", zorder=0); ax.set_axisbelow(True)
     ax.set_ylim(-0.7, len(labels) - 0.3)
     ax.legend(loc="lower center", ncol=2, borderaxespad=0.3, framealpha=0.95,
@@ -211,22 +213,22 @@ def rdf_figure(path, r, g, g_tot, shells, title, wc, wc_band=None, elements=None
     plt.close(fig)
 
 
-def pressure_summary(path, cal, per_pressure, wc_band, elements=None):
-    """Lattice constant, sigma^2 and the WC band against pressure."""
-    els = tuple(elements) if elements is not None else ELEMENTS
-    P = sorted(per_pressure)
+def series_summary(path, per_point, wc_band, elements, unit=""):
+    """Nearest-neighbour distance, sigma^2 and the WC band along the series."""
+    els = tuple(elements)
+    P = sorted(per_point)
+    xlab = axis_label(unit)
     fig, axes = plt.subplots(1, 3, figsize=(7.6, 2.5), gridspec_kw=dict(wspace=0.34))
-    a = [per_pressure[p]["a0"] for p in P]
-    nn = [per_pressure[p]["nn_distance"] for p in P]
-    s2 = [per_pressure[p]["sigma2_nn"] for p in P]
+    nn = [per_point[p]["nn_distance"] for p in P]
+    s2 = [per_point[p]["sigma2_nn"] for p in P]
     ax = axes[0]
     ax.plot(P, nn, "o-", color=C_FIT, lw=1.4, ms=5)
-    ax.set_xlabel("pressure (GPa)"); ax.set_ylabel(r"$r_{\rm NN}$  (Å)")
+    ax.set_xlabel(xlab); ax.set_ylabel(r"$r_{\rm NN}$  (Å)")
     ax.set_title(r"$r_{\rm NN}$", fontsize=8.5, pad=4)
     ax.grid(zorder=0); ax.set_axisbelow(True)
     ax = axes[1]
     ax.plot(P, np.array(s2) * 1e3, "o-", color=C_IDEAL, lw=1.4, ms=5)
-    ax.set_xlabel("pressure (GPa)")
+    ax.set_xlabel(xlab)
     ax.set_ylabel(r"$\sigma^2_{\rm NN}$  ($10^{-3}$ Å$^2$)")
     ax.set_title(r"$\sigma^2_{\rm NN}$", fontsize=8.5, pad=4)
     ax.grid(zorder=0); ax.set_axisbelow(True)
@@ -240,7 +242,7 @@ def pressure_summary(path, cal, per_pressure, wc_band, elements=None):
         lo = np.array(wc_band[p]["wc_min"]); hi = np.array(wc_band[p]["wc_max"])
         ax.bar(x + (n - (len(P) - 1) / 2) * wbar, hi - lo, bottom=lo, width=0.9 * wbar,
                color=pcol[n % len(pcol)],
-               label=f"{p} GPa", alpha=0.85)
+               label=point_label(p, unit), alpha=0.85)
     ax.axhline(0, color=INK2, lw=0.8)
     ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=6.5, rotation=30)
     ax.set_ylabel(r"$\alpha$ range")
@@ -272,9 +274,8 @@ def sro_by_shell(path, shells, alpha, elements, title=None, band1=None,
                  void=None, note=None, nshell=4):
     """Warren-Cowley parameters per shell, one bar per ordered pair.
 
-    Matches the layout of EXAFS_RDF_RMC's sro_by_shell.png so the two
-    pipelines can be read side by side: shells across the x axis, the nine
-    ordered pairs as grouped bars, clustering above zero and ordering below.
+    Shells across the x axis, the ordered pairs as grouped bars, clustering
+    above zero and ordering below.
 
     `band1` (lo, hi) draws the shell-1 calibration systematic as an error bar,
     and `void` greys out pairs with no independent data behind them.

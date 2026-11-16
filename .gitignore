@@ -17,13 +17,11 @@ venv/
 env/
 .python-version
 
-# --- FEFF8L working directories -------------------------------------------
-# feff8l_tables.py runs FEFF in a scratch tree and copies only the
-# feffNNNN.dat it needs into data/. The run directories hold ~30 MB of
-# intermediate .pad/.json/.dat per absorber and are not worth keeping.
-results/feff8l_runs/
-results/feff8l_ms/
-results/feff8l_foils/
+# --- working directories ---------------------------------------------------
+# feff8l_tables.py and export_athena.py work under results/; only the
+# feffNNNN.dat a fit needs is copied into data/. The run directories hold
+# ~30 MB of intermediate .pad/.json/.dat per absorber.
+results/
 **/feff.pad
 **/phase.pad
 **/pot.pad

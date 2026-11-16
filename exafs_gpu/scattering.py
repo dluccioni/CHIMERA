@@ -7,7 +7,8 @@ feffNNNN.dat tables can be dropped in later (see `ScatteringTables.from_feff`).
 The bundled `analytic_transition_metal_tables` is a STAND-IN, not FEFF output.
 It reproduces the qualitative features that matter for a method comparison:
   * |f(k)| rises from zero, peaks near k ~ 3-5 A^-1, decays at high k
-  * amplitude scales with Z, so Cr(24) is separable but Co(27)/Ni(28) are not
+  * amplitude scales with Z, so neighbours in the periodic table (Co/Ni) are
+    barely separable while species a few Z apart (Cr/Ni) are
   * total phase delta(k) = delta_absorber(k) + delta_scatterer(k), smooth in k
   * lambda(k) follows the usual "universal curve" shape
 
@@ -27,13 +28,6 @@ SYMBOLS = ("H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe 
            "Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re "
            "Os Ir Pt Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U").split()
 Z_TABLE = {s: i + 1 for i, s in enumerate(SYMBOLS)}
-
-# The default system - equiatomic CrCoNi - kept here by name so code written
-# against the constants keeps working. NOT a statement about what the
-# package can fit: see chimera/system.py.
-ELEMENTS = ("Cr", "Co", "Ni")
-Z_OF = {e: Z_TABLE[e] for e in ELEMENTS}
-NSP = len(ELEMENTS)
 
 # Table-set name for paths the native engine computes in-process
 # (exafs_gpu.abinitio.provider): "native", or "native:<recipe options>".
@@ -55,14 +49,14 @@ def _meta(root):
 class ScatteringTables:
     """Tabulated scattering functions on a shared k-grid.
 
-    f      : (NSP, Nk)        backscattering amplitude, indexed by scatterer
-    delta  : (NSP, NSP, Nk)   total phase, indexed [absorber, scatterer]
+    f      : (nsp, Nk)        backscattering amplitude, indexed by scatterer
+    delta  : (nsp, nsp, Nk)   total phase, indexed [absorber, scatterer]
     lam    : (Nk,)            photoelectron mean free path (Angstrom)
     k      : (Nk,)            wavenumber grid (A^-1)
     s02    : float            amplitude reduction factor
 
     Optional, filled by the first-principles generator:
-    red          : (NSP, Nk)  central-atom reduction factor |exp(2i delta_1)|
+    red          : (nsp, Nk)  central-atom reduction factor |exp(2i delta_1)|
                    by absorber. Its composition average is already folded
                    into f (the kernel carries one amplitude per scatterer).
     e0_offset_ev : where k = 0 of this table sits relative to the Fermi
@@ -72,11 +66,12 @@ class ScatteringTables:
                    is measured from the edge, expect a fitted E0 shift of
                    about -e0_offset_ev.
     meta         : provenance and the muffin-tin / interstitial parameters
-    k_of_p       : (NSP, Nk) for each absorber edge, the k measured from the
+    k_of_p       : (nsp, Nk) for each absorber edge, the k measured from the
                    calculation's Fermi level that goes with each internal
                    momentum on the grid: p^2 - k^2 is the energy-dependent
-                   inner potential (self-energy included), 15 -> 6 eV over
-                   k = 3-13 for CrCoNi. None for tables tabulated on p alone.
+                   inner potential (self-energy included), which typically
+                   falls by several eV over k = 3-13 for 3d metals. None for
+                   tables tabulated on p alone.
     """
     k: np.ndarray
     f: np.ndarray
@@ -100,7 +95,7 @@ class ScatteringTables:
 
     @property
     def nsp(self):
-        """Number of species. NOT the module-level NSP: that is only the default."""
+        """Number of species."""
         return self.f.shape[0]
 
     def as_float64(self):
@@ -110,7 +105,7 @@ class ScatteringTables:
                 np.ascontiguousarray(self.lam, np.float64))
 
     @staticmethod
-    def from_feff(paths: dict, k: np.ndarray, elements=ELEMENTS, s02: float = 0.85,
+    def from_feff(paths: dict, k: np.ndarray, elements, s02: float = 0.85,
                   composition=None) -> "ScatteringTables":
         """Build tables from real FEFF feffNNNN.dat single-scattering files.
 
@@ -124,7 +119,7 @@ class ScatteringTables:
             composition, route="FEFF8L")
 
     @staticmethod
-    def from_records(records: dict, k: np.ndarray, elements=ELEMENTS, s02: float = 0.85,
+    def from_records(records: dict, k: np.ndarray, elements, s02: float = 0.85,
                      composition=None, route="FEFF8L", extra_meta=None) -> "ScatteringTables":
         """Build tables from path records, (absorber, scatterer) -> the dict
         `columns_to_record` makes: from files (`from_feff`) or handed over in
@@ -202,7 +197,7 @@ def tables_root(name):
                         "data", name)
 
 
-def feff8l_tables(k, name="crconi_fcc2517", elements=None, s02=0.85, composition=None):
+def feff8l_tables(k, name, elements=None, s02=0.85, composition=None):
     """Tables from the FEFF8L alloy runs in data/<name>/.
 
     One run per absorber, produced by feff8l_tables.py; each holds the
@@ -211,7 +206,10 @@ def feff8l_tables(k, name="crconi_fcc2517", elements=None, s02=0.85, composition
     """
     root = tables_root(name)
     if elements is None:
-        elements = tuple(_meta(root).get("elements") or ELEMENTS)
+        elements = _meta(root).get("elements")
+        if not elements:
+            raise FileNotFoundError(f"{root} has no meta.json naming the elements; "
+                                    f"pass elements=")
     elements = tuple(elements)
     paths = {}
     for a in elements:
@@ -226,29 +224,22 @@ def feff8l_tables(k, name="crconi_fcc2517", elements=None, s02=0.85, composition
                                       composition=composition)
 
 
-def default_tables(k, which=None, s02=0.85, elements=None):
-    """The tables the fitting scripts use.
-
-    which: "feff8l" (real FEFF8L output - what produced the published results)
-           or "analytic" (a hand-tuned 3d-transition-metal stand-in, used only
-           by the kernel validation tests). Defaults to the EXAFS_TABLES
-           environment variable, then "feff8l".
-    """
-    import os
-    which = which or os.environ.get("EXAFS_TABLES", "feff8l")
+def default_tables(k, which, s02=0.85, elements=None):
+    """Tables by kind: "analytic" (the Z-parameterised stand-in below, for
+    kernel tests) or the name of a FEFF8L set under data/."""
     k = np.asarray(k, float)
-    if which == "feff8l":
-        return feff8l_tables(k, s02=s02, elements=elements)
     if which == "analytic":
-        return analytic_transition_metal_tables(k, s02=s02, elements=elements)
-    raise ValueError(f"unknown tables {which!r}; CHIMERA ships 'feff8l' and 'analytic'")
+        if elements is None:
+            raise ValueError("analytic tables need elements=")
+        return analytic_transition_metal_tables(k, elements, s02=s02)
+    return feff8l_tables(k, which, s02=s02, elements=elements)
 
 
-def analytic_transition_metal_tables(k: np.ndarray, s02: float = 0.85,
-                                     elements=None) -> ScatteringTables:
-    """Physically-shaped stand-in tables, parameterised by Z (tuned around
-    Cr / Co / Ni; any elements are accepted). See module docstring."""
-    elements = tuple(elements) if elements is not None else ELEMENTS
+def analytic_transition_metal_tables(k: np.ndarray, elements, s02: float = 0.85
+                                     ) -> ScatteringTables:
+    """Physically-shaped stand-in tables, parameterised by Z (tuned on the
+    3d transition metals; any elements are accepted). See module docstring."""
+    elements = tuple(elements)
     nsp = len(elements)
     k = np.asarray(k, np.float64)
     kk = np.maximum(k, 1e-6)
@@ -290,8 +281,7 @@ def analytic_transition_metal_tables(k: np.ndarray, s02: float = 0.85,
 def contrast_report(tab: ScatteringTables, labels=None) -> str:
     """Quantify how separable the scatterers are - the crux of the problem."""
     n = tab.nsp
-    labels = labels or (ELEMENTS if n == len(ELEMENTS)
-                        else tuple(f"s{i}" for i in range(n)))
+    labels = labels or tuple(tab.meta.get("elements") or (f"s{i}" for i in range(n)))
     lines = ["Backscattering amplitude contrast (RMS relative difference over k):"]
     for i in range(n):
         for j in range(i + 1, n):

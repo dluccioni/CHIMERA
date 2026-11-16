@@ -5,10 +5,9 @@ same atoms, potentials, RPATH and NLEG, read from that set's feff.inp - and
 changes only the physics cards, so FEFF8L and FEFF10 tables differ in the
 theory and in nothing else:
 
-    python feff10_tables.py --from crconi_fcc2517    --tag rpa_mpse
-    python feff10_tables.py --from crconi_fcc2517_ms --tag rpa_mpse
+    python feff10_tables.py --from feni_fcc2538 feni_fcc2538_ms --tag rpa_mpse
 
-writes data/crconi_fcc2517_feff10_rpa_mpse[_ms]/<absorber>/feffNNNN.dat with a
+writes data/feni_fcc2538_feff10_rpa_mpse[_ms]/<absorber>/feffNNNN.dat with a
 meta.json, readable wherever a FEFF8L set is (`--tables` / `--ms-tables`).
 
 Tags (exafs_gpu.feff10.Settings): fsr (FEFF8L's physics), rpa, fsr_mpse,
@@ -104,7 +103,8 @@ def build(src_name, tag, elements=None, workers=3):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--from", dest="src", nargs="+", default=["crconi_fcc2517", "crconi_fcc2517_ms"])
+    ap.add_argument("--from", dest="src", nargs="+", required=True,
+                    help="FEFF8L table sets under data/ to rebuild")
     ap.add_argument("--tag", nargs="+", default=["rpa_mpse"], choices=sorted(TAGS))
     a = ap.parse_args()
     for tag in a.tag:

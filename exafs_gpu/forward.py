@@ -20,7 +20,6 @@ import numpy as np
 import cupy as cp
 from . import kernels
 from .lattice import KB
-from .scattering import NSP
 
 _TPB = 256  # power of two: the block reduction assumes it
 
@@ -81,7 +80,7 @@ class ForwardModel:
         dflat = np.ascontiguousarray(delta.reshape(self.nsp ** 2, -1))
         self.d_delta = cp.asarray(dflat)
         # cos/sin of the phase, so the soft kernels can use the angle-addition
-        # identity and call sincos once per (pair, k) rather than NSP*NSP times
+        # identity and call sincos once per (pair, k) rather than nsp*nsp times
         self.d_cosd = cp.asarray(np.ascontiguousarray(np.cos(dflat)))
         self.d_sind = cp.asarray(np.ascontiguousarray(np.sin(dflat)))
         self.d_lam = cp.asarray(lam)
@@ -189,7 +188,7 @@ class ForwardModel:
         return chi
 
     def chi_soft(self, pos, w, r=None, normalise=True):
-        """Relaxed-occupancy chi. w (nconf, natoms, NSP) on the simplex."""
+        """Relaxed-occupancy chi. w (nconf, natoms, nsp) on the simplex."""
         nconf = pos.shape[0]
         if r is None:
             r, _ = self.distances(pos)
@@ -207,7 +206,7 @@ class ForwardModel:
     # ---------------------------------------------------------------- adjoint
     def grad_pos(self, pos, species, gchi, r=None, evec=None, ptype=None,
                  normalise=True):
-        """dL/dpos given dL/dchi (nconf, NSP, nk)."""
+        """dL/dpos given dL/dchi (nconf, nsp, nk)."""
         nconf = pos.shape[0]
         if r is None or evec is None:
             r, evec = self.distances(pos)

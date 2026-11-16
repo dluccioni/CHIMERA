@@ -13,7 +13,7 @@ and phase depend only on its class, the absorber's species and the species
 at its 1-3 other sites. So:
 
   1. `build`: for every class and every assignment of species to its sites
-     (327 paths per absorber for fcc), one FEFF path with degeneracy 1,
+     (327 paths per absorber for an fcc ternary), one FEFF path with degeneracy 1,
      written into a custom paths.dat and computed by FEFF10's genfmt and ff2x
      on the potentials of an existing FEFF10 run. pot and xsph are not rerun,
      so the scattering physics is exactly that run's.
@@ -207,7 +207,7 @@ def build(src, out=None, verbose=True):
     meta = _meta(root)
     els = tuple(meta["elements"])
     nsp = len(els)
-    d_nn = float(meta.get("d_nn", 2.517))
+    d_nn = float(meta["d_nn"])
     unit = d_nn / np.sqrt(2.0)                      # a0 / 2 for fcc
     out = out or (src + "lib")
     dst = tables_root(out) if os.path.isabs(out) else os.path.join(os.path.dirname(root), out)

@@ -1,30 +1,22 @@
 """Infer the unrecorded processing parameters, and the regime of validity.
 
-Regime of validity (measured, not assumed)
-------------------------------------------
-Fitting an ideal random FCC model to the 0 GPa location-averaged spectra and
-looking at the residual band by band, WITH the multiple-scattering term:
+Fit range
+---------
+`FIT_RMIN, FIT_RMAX` (1.4-5.0 A) cover the first four shells of an fcc
+3d-metal alloy with a0 near 3.6 A. Below the first shell |chi(R)| holds the
+background and the atomic residual; past the last modelled shell the model
+has no paths. Another lattice or lattice constant needs its own range
+(`rmin`, `rmax`; `--rmin`, `--rmax` on the command line). `band_report`
+scores the model band by band against the data and the noise, which is the
+evidence for where the range should stop.
 
-    R band (A)   R-factor        what is there
-    0.6 - 1.2      0.13-0.80  background / atomic residual: not structure
-    1.2 - 1.4      0.08-0.43  rising flank of shell 1, still contaminated
-    1.4 - 1.8      0.04-0.13  shell 1 flank
-    1.8 - 2.6      0.006-0.015  shell 1
-    2.6 - 3.3      0.04-0.09  the trough between peaks
-    3.3 - 4.1      0.02-0.05  shells 2 and 3
-    4.1 - 4.8      0.001-0.03  shell 4 - only once MS is included
-    4.8 - 5.0      0.002-0.07  tail of shell 4
-    5.0 +          0.10-0.85  shell 5 and beyond: not modelled
-
-    FIT RANGE  R = 1.4 - 5.0 A   (shells 1-4)
-
-Without multiple scattering the model has to stop at 4.2 A: in fcc, twice the
-nearest-neighbour distance equals the fourth-shell radius to one part in 5000,
-so the forward-focused collinear path lands exactly on the fourth-shell peak
-and carries about 11x the single-scattering amplitude there. A pair-only model
-is not slightly wrong in that region, it is missing most of the intensity -
-R-factor 0.40 while the data is 25x the noise. `multiscat.py` adds FEFF8L's
-3- and 4-leg paths and the same band drops to 0.005.
+Without multiple scattering the model has to stop before the first collinear
+shell: in fcc, twice the nearest-neighbour distance equals the fourth-shell
+radius, so the forward-focused collinear path lands on the fourth-shell peak
+and carries several times the single-scattering amplitude there. A pair-only
+model is missing most of the intensity in that band. `FIT_RMAX_NOMS` (4.2 A)
+is that limit for fcc near 3.6 A; `multiscat.py` adds the 3- and 4-leg paths
+that let the fit go further.
 
 How the calibration is done
 ---------------------------
@@ -32,10 +24,11 @@ The random-alloy model is linear in the pair counts, so the whole objective
 runs on the CPU in a few milliseconds (`shellmodel.ShellModel`) and the search
 can afford to be global: differential evolution over every continuous
 processing and model parameter at once, repeated for each candidate k weight,
-scored by the R-factor of the random-alloy expectation against the 0 GPa
-location median with the per-edge amplitude profiled out.
+scored by the R-factor of the random-alloy expectation against the reference
+point's position median with the per-edge amplitude profiled out. The
+reference point is 0 when the series has one, else its first point.
 
-    stage 1 (0 GPa, a0 anchored at the literature value)
+    stage 1 (the reference point, a0 anchored to `a0_ambient` unless freed)
         dE0 per edge, the k window (kmin, kmax), the sigma^2 scale and the
         per-shell sigma^2 factors, the pair-type bond-length offsets dr, the
         first-shell third cumulant C3, and the MS amplitude and Debye-Waller
@@ -43,24 +36,24 @@ location median with the per-edge amplitude profiled out.
         factors locates the E0 / window basin, then the full search starts
         from it (a modest budget without that continuation stalls with the
         offsets pinned at their bounds).
-    stage 2 (every pressure)
+    stage 2 (every series point)
         a0 and the global sigma^2 scale, everything else held; a0 stays at
-        the anchor at the anchor pressure.
-    stage 3 (joint, when more than one pressure is available)
+        the anchor at the reference point when it is anchored.
+    stage 3 (joint, when the series has more than one point)
         the shared parameters again, scored on the MEAN R-factor over every
-        pressure with the per-pressure a0 and sigma^2 held, then stage 2
-        once more. All pressures were measured on the same beamline with the
-        same edges, so the processing choices are common to them; using all
-        of them matters here because at 0 GPa the Co and Ni files hold the
-        same spectrum, which no physical model can fit consistently on its own.
+        point together with each point's a0 and sigma^2, then stage 2 once
+        more. A series measured with one set of edges and one processing
+        shares those choices, so every point constrains them, and a single
+        defective point (a duplicated or mislabelled folder) cannot set them
+        on its own.
 
     The whole sequence runs once per k weight in `kweights` and the k weight
     with the lowest joint score is kept.
 
-The k weight, k range and E0 are genuine processing choices the experimenters
-made and did not record; if the Athena project files turn up, the values in
-them replace stage 1 outright. The earlier manual scan that fixed k^3 and
-3-13 A^-1 is what `calibrate_legacy` still does.
+When only |chi(R)| was exported, the k weight, the k range and E0 are
+processing choices that were made and not recorded, so they are inferred
+here; if the processing record turns up, its values replace stage 1.
+`calibrate_legacy` is the simpler scheme: k^3 and 3-13 A^-1 fixed, Nelder-Mead.
 
 With chi(k) data (`chik.ChiK` inputs) two of those choices become ours:
 the window is applied identically to data and model, so it is held at the
@@ -68,18 +61,19 @@ values given (`free_window` is switched off - searching it would only tune
 a weighting to the model), and the k weight defaults to fitting k^1, k^2 and
 k^3 at once (`KWEIGHTS_CHIK`) instead of scanning. E0 per edge stays a
 fitted parameter - now determined by the phase rather than traded against
-a0 - and `anchor_a0=False` lets the ambient lattice constant float with it,
+a0 - and `anchor_a0=False` lets the reference lattice constant float with it,
 which is only sensible once the phase is there to separate the two.
 
 The a0 / E0 degeneracy
 ----------------------
 The first-shell peak position depends on the lattice constant and on the
-threshold energy in nearly the same way, so fitting both to one pressure is
-ill-posed: free fits wander from a0 = 3.45 to 3.61 A. It is broken by
-anchoring the AMBIENT lattice constant to the literature value for equiatomic
-CrCoNi, a0(0 GPa) = 3.566 A, fitting dE0 per edge there, and then holding dE0
-fixed while a0 is fitted at every other pressure - legitimate because all four
-pressures were measured on the same beamline with the same edges and the same
+threshold energy in nearly the same way, so from |chi(R)| alone fitting both
+to one series point is ill-posed. It is broken by anchoring the reference
+point's lattice constant to an independent value (`a0_ambient`: by default
+the system's `a0_ref`; for a series that does not start at ambient, the
+literature value taken to that point's conditions), fitting dE0 per edge
+there, and holding it while a0 is fitted at every other point - legitimate
+when all points were measured with the same edges and the same
 normalisation. The bond-length offsets dr are constrained to a
 composition-weighted mean of zero for the same reason: their mean IS a0.
 """
@@ -88,21 +82,18 @@ import time
 import numpy as np
 from scipy.optimize import minimize, differential_evolution
 
-from exafs_gpu.scattering import ELEMENTS, NSP
 from . import dataio as io
 from . import model as M
 from . import shellmodel as SM
 from .chik import ChiK, as_kweights, kweight_label, kweight_value
 from .system import pair_labels
 
-A0_AMBIENT = 3.566        # equiatomic CrCoNi, literature (the default system)
 A0_BOUNDS_REL = (0.953, 1.0236)   # search range for a0 relative to the reference
 FIT_RMIN, FIT_RMAX = 1.4, 5.0
 FIT_RMAX_NOMS = 4.2       # where a single-scattering model has to stop
 KMIN, KMAX, KWEIGHT = 3.0, 13.0, 3
 KWEIGHTS_MAG = (2, 3, 4)          # scanned, for |chi(R)| files
 KWEIGHTS_CHIK = ((1, 2, 3),)      # fitted together, for chi(k) files
-DR_LABELS = pair_labels(ELEMENTS)        # the default system's pair labels
 
 
 def fit_mask(R, rmin=FIT_RMIN, rmax=FIT_RMAX):
@@ -116,17 +107,17 @@ def mean_zero(u):
     return np.append(u, -u.sum())
 
 
-def _averages(spectra, pressures=None):
-    """{P: data} from the dataio structure, or from a dict keyed by pressure.
+def _averages(spectra, points=None):
+    """{P: data} from the dataio structure, or from a dict keyed by series point.
 
     `data` is a (nsp, nR) |chi(R)| array or a ChiK, whichever the files hold
     (`dataio.fit_input`)."""
     if all(isinstance(k, (int, np.integer)) for k in spectra):
         return {int(P): (v if isinstance(v, ChiK) else np.asarray(v, float))
-                for P, v in spectra.items() if pressures is None or P in pressures}
+                for P, v in spectra.items() if points is None or P in points}
     P_all = sorted({P for (P, _el) in spectra})
     return {P: io.fit_input(spectra, P) for P in P_all
-            if pressures is None or P in pressures}
+            if points is None or P in points}
 
 
 dr_from_free = SM.dr_from_free
@@ -156,8 +147,8 @@ class Stage1:
             self.names.append(name); self.bounds.append((float(lo), float(hi)))
 
         # dE0 carries the whole inner potential when the k gap is taken as
-        # constant (centre 12 eV, the historical -5..35 window), only the E0
-        # offset when k is mapped through the tables (centre 0)
+        # constant (centre 12 eV, searched over -5..35), only the E0 offset
+        # when k is mapped through the tables (centre 0)
         self.dE0_start = M.dE0_centre(getattr(sm, "system", None))
         if dE0_bounds is None:
             dE0_bounds = (self.dE0_start - 17.0, self.dE0_start + 23.0)
@@ -269,7 +260,7 @@ def _record(sm, N0, data, mask, idx, extra=None):
     return out
 
 
-def _win_str(kmin, kmax, elements=ELEMENTS):
+def _win_str(kmin, kmax, elements):
     """A readable window, whether it is one number or one per edge."""
     lo, hi = np.atleast_1d(kmin), np.atleast_1d(kmax)
     if lo.size == 1 and hi.size == 1:
@@ -282,44 +273,50 @@ def _win_str(kmin, kmax, elements=ELEMENTS):
 def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
               rmin=FIT_RMIN, rmax=FIT_RMAX, a0_ambient=None, ms=True,
               verbose=True, kweights=None, free_window=True, free_dr=True,
-              free_c3=True, free_shell_sigma=True, free_dE0_per_pressure=False,
-              free_dE0_edge_per_pressure=False,
-              joint=True, de_maxiter=120, de_popsize=12, seed=0, pressures=None,
+              free_c3=True, free_shell_sigma=True, free_dE0_per_point=False,
+              free_dE0_edge_per_point=False,
+              joint=True, de_maxiter=120, de_popsize=12, seed=0, points=None,
               anchor_a0=True, free_c4=False, free_sigma_pair=False,
               free_ms_edge=False, x0_values=None, system=None,
               joint_a0=True):
     """Global calibration in pair-count space. Returns ({P: dict}, S).
 
     See the module docstring for what is fitted where. `S` is returned set to
-    the anchor-pressure calibration so it can be used for the band report.
+    the reference point's calibration so it can be used for the band report.
+    `points` restricts the calibration to those series points.
 
     `kweights` lists the candidates the scan chooses between; an entry may be
     one integer or several fitted together, e.g. `(2, 3, (1, 2, 3))`. The
     default is KWEIGHTS_MAG for |chi(R)| inputs and KWEIGHTS_CHIK for chi(k).
-    `anchor_a0=False` frees the ambient lattice constant in stage 2 (chi(k)
+    `anchor_a0=False` frees the reference lattice constant (chi(k)
     data only; see the module docstring). `a0_ambient` defaults to the
     system's reference lattice constant. `system` names the alloy when `S`
     is not given (see chimera/system.py).
 
-    `joint_a0` (the default) puts every pressure's a0 and sigma^2 scale -
-    and, when freed, its mean-zero per-edge E0 shift - into the joint stage
+    `joint_a0` (the default) puts every point's a0 and sigma^2 scale - and,
+    when freed, its mean-zero per-edge E0 shift - into the joint stage
     alongside the shared parameters, instead of holding them at their
     stage-2 values. That is what lets the COMMON E0 settle where all the
-    pressures together put it: with a0 held, moving E0 is a step off the
-    a0/E0 ridge at every pressure at once and the joint stage cannot move
-    it, so it stayed wherever the first pressure's stage 1 left it, and the
-    per-pressure a0 then each walked their own stretch of the ridge in
-    stage 2 - which is a noisy equation of state. Off reproduces the
-    2026-09 behaviour.
+    points together put it: with a0 held, moving E0 is a step off the a0/E0
+    ridge at every point at once and the joint stage cannot move it, so it
+    stays wherever the reference point's stage 1 left it, and each point's
+    a0 then walks its own stretch of the ridge in stage 2, which shows up as
+    scatter along the series.
+
+    `free_dE0_edge_per_point` adds a mean-zero per-edge E0 shift at every
+    point (nsp-1 numbers each): the freedom a0 cannot absorb, one edge's
+    distance scale moving relative to another's. `free_dE0_per_point` adds
+    a common E0 shift per point on top; it is degenerate with a0 point by
+    point, so free it together with a0 or not at all.
     """
-    AV = _averages(spectra, pressures)
+    AV = _averages(spectra, points)
+    unit = getattr(spectra, "unit", "")
     chik = any(isinstance(v, ChiK) for v in AV.values())
+    window_note = False
     if chik:
         assert all(isinstance(v, ChiK) for v in AV.values()), \
-            "cannot mix chi(k) and |chi(R)| inputs across pressures"
-        if free_window and verbose:
-            print("  chi(k) input: the k window is a choice, not a parameter - "
-                  f"holding it at {_win_str(kmin, kmax)} A^-1", flush=True)
+            "cannot mix chi(k) and |chi(R)| inputs across series points"
+        window_note = free_window and verbose
         free_window = False
     elif not anchor_a0:
         raise ValueError("anchor_a0=False needs chi(k) data: from |chi(R)| alone "
@@ -330,6 +327,9 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
     S = S or M.Spectrum(system=system, kmin=kmin, kmax=kmax, kweight=kweight, ms=ms)
     nsp, els = S.nsp, S.elements
     labels = pair_labels(els)
+    if window_note:
+        print("  chi(k) input: the k window is a choice, not a parameter - "
+              f"holding it at {_win_str(kmin, kmax, els)} A^-1", flush=True)
     if a0_ambient is None:
         a0_ambient = float(S.a0_ref)
     a0_lo, a0_hi = S.a0_ref * A0_BOUNDS_REL[0], S.a0_ref * A0_BOUNDS_REL[1]
@@ -342,12 +342,11 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
     N0 = sm.random_counts()
     comp = sm.absorber_counts(N0) / sm.natoms
     # Stage 1 holds a0 at `a0_ambient` while it fits dE0, which is what breaks
-    # the a0/E0 degeneracy - but only if the reference point IS ambient. With
-    # `anchor_a0=False` there is nothing to anchor to (the 2026-09-15 chi(k)
-    # export starts at 3 GPa), and pinning a0 to the ambient literature value
-    # there biases dE0: on that data it left the shared dE0 ~2.5 eV off and
-    # every pressure 0.018 A high in a0, for a 24% worse R-factor. So a0 joins
-    # the stage-1 search instead, which the phase makes identifiable.
+    # the a0/E0 degeneracy - but only if the anchor is right for the
+    # reference point. A wrong anchor (an ambient value at a point that is not
+    # ambient) biases dE0 and, through it, every point's a0. With
+    # `anchor_a0=False` a0 joins the stage-1 search instead, which the phase
+    # of chi(k) data makes identifiable.
     flags = dict(ms=ms, free_window=free_window, free_dr=free_dr, free_c3=free_c3,
                  free_shell_sigma=free_shell_sigma, free_a0=not anchor_a0,
                  free_c4=free_c4, free_sigma_pair=free_sigma_pair,
@@ -356,8 +355,8 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
     core = Stage1(sm, comp, ms=ms, free_window=free_window, free_dr=False,
                   free_c3=False, free_shell_sigma=False, free_a0=not anchor_a0,
                   elements=els)
-    # stage 3 refits only the parameters COMMON to every pressure, and a0 is
-    # not one of them - it is held per pressure there and refit by stage 2
+    # stage 3 refits only the parameters COMMON to every point, and a0 is
+    # not one of them - it is held per point there and refit by stage 2
     shared = Stage1(sm, comp, with_sigma=False, **{**flags, "free_a0": False})
     data0 = AV[P0]
     de = dict(seed=seed, tol=1e-8, polish=True)
@@ -368,44 +367,35 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
         sm.set_params(kweight=kw, **p)
         return sm.r_factor(N0, data0, mask, idx)
 
-    # ---- stage 2: a0 (and the sigma^2 scale) per pressure, everything else
-    # held. At the anchor pressure a0 stays at the literature value: it was
+    # ---- stage 2: a0 (and the sigma^2 scale) per point, everything else
+    # held. At an anchored reference point a0 stays at the anchor: it was
     # used to fix dE0, so freeing it again there would be circular.
     def score2(y, data, anchored, fixed):
         kw = dict(sigma_scale=np.exp(y[0]))
         kw["a0"] = a0_ambient if anchored else y[1]
-        if free_dE0_per_pressure:
+        if free_dE0_per_point:
             # y is [log sigma_scale] + ([a0] unless anchored) + [common shift]
             # + ([u, v] for the per-edge shift), so the common shift sits right
-            # after a0 - one slot earlier when this pressure is anchored.
+            # after a0 - one slot earlier when this point is anchored.
             kw["dE0"] = np.asarray(fixed["dE0"]) + y[1 if anchored else 2]
-        if free_dE0_edge_per_pressure:
-            # A MEAN-ZERO shift across the edges, nsp-1 free numbers. What is
-            # left is exactly the freedom a0 cannot absorb - one edge's
-            # distance scale moving relative to another's, which is what the
-            # measured per-edge compression anomaly looks like.
-            #
-            # The mean is excluded HERE because it is degenerate with a0, not
-            # because it is unmeasurable: `free_dE0_per_pressure` frees it, and
-            # on the 2026-09-16 export with per-edge windows the (a0, E0) plane
-            # was mapped (scripts/test_common_dE0.py) and the ridge is tilted
-            # but NOT flat - 3 of 169 cells lie within 2% of the minimum, and
-            # the peak-alignment contour is nearly horizontal, so the first-
-            # shell peak position is an E0 constraint rather than an a0 one.
-            # Free the two together or neither; one at a time is worse than
-            # neither. See testing/MODEL_CHANGES.md item 1.
+        if free_dE0_edge_per_point:
+            # A MEAN-ZERO shift across the edges, nsp-1 free numbers: exactly
+            # the freedom a0 cannot absorb, one edge's distance scale moving
+            # relative to another's. The mean is left out HERE because it is
+            # degenerate with a0 point by point; `free_dE0_per_point` frees
+            # it, and is only worth freeing together with a0.
             kw["dE0"] = (np.asarray(kw.get("dE0", fixed["dE0"]), float)
                          + mean_zero(y[-(nsp - 1):]))
         sm.set_params(**fixed); sm.set_params(**kw)
         return sm.r_factor(N0, data, mask, idx)
 
     # index of the common dE0 shift inside y: after sigma_scale and, unless the
-    # pressure is anchored, a0. Anchored pressures shift it down by one, so it
-    # is resolved per pressure inside stage2 rather than assumed here.
+    # point is anchored, a0. Anchored points shift it down by one, so it is
+    # resolved per point inside stage2 rather than assumed here.
     def stage2(p_shared, extra, start=None):
-        """a0, sigma^2 (and the per-pressure E0 shifts) per pressure with the
+        """a0, sigma^2 (and the per-point E0 shifts) per series point with the
         shared parameters held. `start[P]` seeds the search from a previous
-        per-pressure solution (the joint stage's)."""
+        per-point solution (the joint stage's)."""
         fixed = {k: v for k, v in p_shared.items() if k not in ("a0", "sigma_scale")}
         out = {}
         for P in P_all:
@@ -414,9 +404,9 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
             bounds2 = [(np.log(0.5), np.log(6.0))] + ([] if anchored else [(a0_lo, a0_hi)])
             y0 = ([np.log(st.get("sigma_scale", p_shared["sigma_scale"]))]
                   + ([] if anchored else [st.get("a0", p_shared["a0"])]))
-            if free_dE0_per_pressure:
+            if free_dE0_per_point:
                 bounds2.append((-5.0, 5.0)); y0.append(st.get("dE0_shift", 0.0))
-            if free_dE0_edge_per_pressure:
+            if free_dE0_edge_per_point:
                 bounds2 += [(-4.0, 4.0)] * (nsp - 1)
                 y0 += list(st.get("edge", np.zeros(nsp - 1)))
             r = differential_evolution(score2, bounds2, args=(data, anchored, fixed),
@@ -426,24 +416,24 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
             score2(r.x, data, anchored, fixed)          # leave sm at the optimum
             out[P] = _record(sm, N0, data, mask, idx,
                              extra=dict(kmin=sm.p["kmin"], kmax=sm.p["kmax"],
-                                        rmin=rmin, rmax=rmax, pressure=P,
-                                        a0_anchored=anchored,
+                                        rmin=rmin, rmax=rmax, point=P,
+                                        unit=unit, a0_anchored=anchored,
                                         dE0_shift=(
                                             float(r.x[1 if anchored else 2])
-                                            if free_dE0_per_pressure else 0.0),
+                                            if free_dE0_per_point else 0.0),
                                         dE0_edge_shift=(
                                             mean_zero(r.x[-(nsp - 1):]).tolist()
-                                            if free_dE0_edge_per_pressure
+                                            if free_dE0_edge_per_point
                                             else [0.0] * nsp), **extra))
         return out
 
-    # ---- stage 3: the shared parameters against every pressure at once,
-    # together with each pressure's own a0, sigma^2 scale and (when freed)
-    # mean-zero per-edge E0 shift. The per-pressure block of the vector is
-    # [a0 (unless anchored), log sigma_scale, u_1..u_{nsp-1}] per pressure.
+    # ---- stage 3: the shared parameters against every point at once,
+    # together with each point's own a0, sigma^2 scale and (when freed)
+    # mean-zero per-edge E0 shift. The per-point block of the vector is
+    # [a0 (unless anchored), log sigma_scale, u_1..u_{nsp-1}] per point.
     nshared = len(shared.names)
 
-    def _per_pressure(x, i, P):
+    def _per_point(x, i, P):
         anchored = (P == P0 and anchor_a0)
         q = {}
         if anchored:
@@ -452,7 +442,7 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
             q["a0"] = float(x[i]); i += 1
         q["sigma_scale"] = float(np.exp(x[i])); i += 1
         u = None
-        if free_dE0_edge_per_pressure:
+        if free_dE0_edge_per_point:
             u = np.asarray(x[i:i + nsp - 1], float); i += nsp - 1
         return q, u, i
 
@@ -461,7 +451,7 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
         base = np.asarray(p["dE0"], float)
         tot, i = 0.0, nshared
         for P in P_all:
-            q, u, i = _per_pressure(x, i, P)
+            q, u, i = _per_point(x, i, P)
             if u is not None:
                 q["dE0"] = base + mean_zero(u)
             sm.set_params(kweight=kw, **{**p, **q})
@@ -469,7 +459,7 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
         return tot / len(P_all)
 
     def score3_held(x, kw, a0_P, sig_P):
-        """The 2026-09 joint stage: a0 and sigma^2 held per pressure."""
+        """The joint stage with a0 and sigma^2 held per point (joint_a0=False)."""
         p = shared.unpack(x)
         tot = 0.0
         for P in P_all:
@@ -520,7 +510,7 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
                         b3.append((max(a0_P[P] - 0.03, a0_lo), min(a0_P[P] + 0.03, a0_hi)))
                         x3.append(a0_P[P])
                     b3.append((np.log(0.5), np.log(6.0))); x3.append(np.log(sig_P[P]))
-                    if free_dE0_edge_per_pressure:
+                    if free_dE0_edge_per_point:
                         sh = np.asarray(out[P].get("dE0_edge_shift", [0.0] * nsp))
                         b3 += [(-4.0, 4.0)] * (nsp - 1); x3 += list(sh[:nsp - 1])
                 x3 = np.clip(x3, [b[0] for b in b3], [b[1] for b in b3])
@@ -530,14 +520,14 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
                 p1 = shared.unpack(r3.x[:nshared])
                 start, i = {}, nshared
                 for P in P_all:
-                    q, u, i = _per_pressure(r3.x, i, P)
+                    q, u, i = _per_point(r3.x, i, P)
                     start[P] = dict(a0=q["a0"], sigma_scale=q["sigma_scale"],
                                     edge=(u if u is not None else np.zeros(nsp - 1)))
                 p1.setdefault("a0", start[P0]["a0"])
                 p1.update(kweight=kw, sigma_scale=start[P0]["sigma_scale"])
                 if verbose:
                     a0s = ", ".join(f"{P}: {start[P]['a0']:.4f}" for P in P_all)
-                    print(f"  stage 3 (joint, a0 and sigma^2 per pressure free): "
+                    print(f"  stage 3 (joint, a0 and sigma^2 per point free): "
                           f"mean R={r3.fun:.5f}  dE0={np.round(p1['dE0'], 2)} eV  "
                           f"a0={{{a0s}}}", flush=True)
                 out = stage2(p1, dict(), start=start)
@@ -555,7 +545,7 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
         row["r_factor_joint"] = float(np.mean([out[P]["r_factor_ideal"] for P in P_all]))
         scan.append(row)
         if verbose:
-            print(f"  {kweight_label(kw)}: mean R over {len(P_all)} pressure(s) = {row['r_factor_joint']:.5f}  "
+            print(f"  {kweight_label(kw)}: mean R over {len(P_all)} point(s) = {row['r_factor_joint']:.5f}  "
                   f"dr={dict(zip(labels, np.round(np.array(p1.get('dr', np.zeros((nsp, nsp))))[np.triu_indices(nsp)], 4)))}"
                   f"  C3={p1.get('c3', [0.0])[0]:.2e}  ms_amp={p1.get('ms_amp', 0):.3f} "
                   f"ms_c={p1.get('ms_c', 0):.2f}  sigma_shell={np.round(p1.get('sigma_shell_scale', np.ones(sm.nshell)), 2)}"
@@ -567,8 +557,8 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
                       joint_a0=bool(joint_a0),
                       free=dict(window=free_window, dr=free_dr, c3=free_c3,
                                 shell_sigma=free_shell_sigma,
-                                dE0_edge_per_pressure=bool(free_dE0_edge_per_pressure),
-                                dE0_common_per_pressure=bool(free_dE0_per_pressure)),
+                                dE0_edge_per_point=bool(free_dE0_edge_per_point),
+                                dE0_common_per_point=bool(free_dE0_per_point)),
                       target_complex=bool(chik), a0_anchored=bool(anchor_a0),
                       a0_ambient=float(a0_ambient), system=S.system.to_dict())
     shared_rec["kweight"] = kweight_value(shared_rec["kweight"])
@@ -586,12 +576,13 @@ def calibrate(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEIGHT,
         out[P]["kweight_scan"] = scan
         out[P]["shared"] = shared_rec
         if verbose:
-            print(f"  P={P:2d} GPa: a0={out[P]['a0']:.4f} A  r_NN={out[P]['nn_distance']:.4f} A  "
+            print(f"  {io.point_label(P, unit)}: a0={out[P]['a0']:.4f} A  "
+                  f"r_NN={out[P]['nn_distance']:.4f} A  "
                   f"sigma2_NN={out[P]['sigma2_nn']:.5f} A^2  R_ideal={out[P]['r_factor_ideal']:.5f}",
                   flush=True)
     if verbose:
         print(f"  chosen {kweight_label(kw_best)}", flush=True)
-    # hand the anchor-pressure calibration back through S
+    # hand the reference point's calibration back through S
     sm.set_params(**{k: v for k, v in out[P0].items() if k in SM.PARAM_NAMES})
     sm.apply_to(S)
     return out, S
@@ -616,9 +607,9 @@ def calibrate_legacy(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEI
     """The original Nelder-Mead calibration on the GPU pair sum (no dr, C3 or
     per-shell sigma^2; window and k weight fixed). Kept for comparison.
 
-    Stage 1  a0 := a0_ambient at 0 GPa; fit dE0 (per edge) and the sigma^2
-             scale to the 0 GPa location-averaged spectra.
-    Stage 2  dE0 fixed; fit a0 and the sigma^2 scale at every pressure.
+    Stage 1  a0 := a0_ambient at the first series point; fit dE0 (per edge)
+             and the sigma^2 scale to its position-averaged spectra.
+    Stage 2  dE0 fixed; fit a0 and the sigma^2 scale at every point.
 
     The configuration used here is a random solid solution - the calibration
     must not depend on the short-range order it is meant to enable measuring.
@@ -633,8 +624,9 @@ def calibrate_legacy(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEI
     idx = M.match_grid(S.R, R_data)
     mask = fit_mask(R_data, rmin, rmax)
     cfgs = [S.random_config(s) for s in seeds]
-    # the window is fixed here, so each pressure's target is fixed too
+    # the window is fixed here, so each point's target is fixed too
     AV = {P: M.target(v, S) for P, v in _averages(spectra).items()}
+    unit = getattr(spectra, "unit", "")
 
     def score(a0, dE0, log_sig, data, log_ms_amp=None, log_ms_c=None):
         S.set_a0(a0); S.set_sigma_scale(np.exp(log_sig))
@@ -666,7 +658,7 @@ def calibrate_legacy(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEI
               f"dE0={np.round(dE0, 2)} eV  sigma_scale={np.exp(best.x[nsp]):.2f}"
               + (f"  ms_amp={ms_amp:.3f} ms_c={ms_c:.2f}" if ms else ""))
 
-    # ---- stage 2: a0 per pressure, dE0 fixed
+    # ---- stage 2: a0 per point, dE0 fixed
     out = {}
     for P in sorted(AV):
         data = AV[P]
@@ -696,20 +688,20 @@ def calibrate_legacy(spectra, R_data, S=None, kmin=KMIN, kmax=KMAX, kweight=KWEI
                       r_factor_ideal=float(b.fun),
                       shells=[float(x) for x in S.shells])
         if verbose:
-            print(f"  P={P:2d} GPa: a0={a0:.4f} A  r_NN={S.shells[0]:.4f} A  "
+            print(f"  {io.point_label(P, unit)}: a0={a0:.4f} A  r_NN={S.shells[0]:.4f} A  "
                   f"sigma2_NN={out[P]['sigma2_nn']:.5f} A^2  R_ideal={b.fun:.4f}")
     return out, S
 
 
 def equation_of_state(cal):
-    """V/V0 and bulk moduli from the fitted lattice constants.
+    """V/V0 and bulk moduli from the fitted lattice constants of a PRESSURE
+    series: `cal` maps the pressure in GPa to a record holding "a0".
 
     `B0_BM2_GPa` is a 2nd-order Birch-Murnaghan fit, which presumes V0 is the
     AMBIENT volume: the form P(V) = 1.5 B0 (x^7 - x^5) has P = 0 at V = V0. It
-    is therefore only reported when the series actually contains 0 GPa. Fitting
-    it to a series that starts at 3 GPa - pretending the 3 GPa volume is the
-    zero-pressure one - inflated B0 from ~250 to 338 GPa on the 2026-09-15
-    chi(k) run, which is an artefact of the missing anchor, not stiffness.
+    is therefore only reported when the series actually contains 0 GPa;
+    treating the first volume of a series that starts above ambient as the
+    zero-pressure one inflates B0.
 
     `B_secant_GPa` needs no such assumption: between any two points it is
     dP / (dV/V), reported for every consecutive pair and, when ambient is
